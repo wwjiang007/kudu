@@ -81,7 +81,6 @@
 #include "kudu/util/thread.h"
 #include "kudu/util/user.h"
 #include "kudu/util/version_info.h"
-#include "kudu/util/website_util.h"
 
 DEFINE_int32(num_reactor_threads, 4, "Number of libev reactor threads to start.");
 TAG_FLAG(num_reactor_threads, advanced);
@@ -439,9 +438,7 @@ Status ServerBase::Init() {
       // `fs_data_dirs` configuration.
       LOG(INFO) << "To start Kudu with a different FS layout, the `kudu fs "
                    "update_dirs` tool must be run first";
-      return s.CloneAndPrepend(
-          strings::Substitute("FS layout already exists; not overwriting existing layout. See $0",
-                              KuduDocsTroubleshootingUrl()));
+      return s.CloneAndPrepend("FS layout already exists; not overwriting existing layout");
     }
     RETURN_NOT_OK_PREPEND(s, "Could not create new FS layout");
     s = fs_manager_->Open(&report);
@@ -469,6 +466,10 @@ Status ServerBase::Init() {
          .set_epki_private_password_key_cmd(FLAGS_rpc_private_key_password_cmd)
          .set_keytab_file(FLAGS_keytab_file)
          .enable_inbound_tls();
+
+  if (options_.rpc_opts.rpc_reuseport) {
+    builder.set_reuseport();
+  }
 
   RETURN_NOT_OK(builder.Build(&messenger_));
   rpc_server_->set_too_busy_hook(std::bind(

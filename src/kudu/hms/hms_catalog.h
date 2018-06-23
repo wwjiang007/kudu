@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -30,6 +31,7 @@
 #include "kudu/util/status.h"
 
 namespace hive {
+class NotificationEvent;
 class Table;
 }
 
@@ -48,6 +50,8 @@ namespace hms {
 class HmsCatalog {
  public:
 
+  static const char* const kInvalidTableError;
+
   explicit HmsCatalog(std::string master_addresses);
   ~HmsCatalog();
 
@@ -64,22 +68,44 @@ class HmsCatalog {
                      const std::string& name,
                      const Schema& schema) WARN_UNUSED_RESULT;
 
-  // Drops a table entry from the HMS, if it exists.
+  // Drops a table entry from the HMS.
   //
-  // This method will fail if the HMS is unreachable, or if the table entry in
-  // the HMS doesn't match the specified Kudu table ID.
+  // This method will fail if the HMS is unreachable, if the table does not
+  // exist in the HMS, or if the table entry in the HMS doesn't match the
+  // specified Kudu table ID.
   Status DropTable(const std::string& id,
                    const std::string& name) WARN_UNUSED_RESULT;
 
-  // Alters a table entry in the HMS, if it exists. If the table entry does not
-  // exist it will be created instead.
+  // Alters a table entry in the HMS.
   //
-  // This method will fail if the HMS is unreachable, or if the table entry in
-  // the HMS doesn't match the specified Kudu table ID.
+  // This method will fail if the HMS is unreachable, if the table doesn't exist
+  // in the HMS, or if the table entry in the HMS doesn't match the specified
+  // Kudu table ID.
   Status AlterTable(const std::string& id,
                     const std::string& name,
                     const std::string& new_name,
                     const Schema& schema) WARN_UNUSED_RESULT;
+
+  // Upgrades a legacy Impala table entry in the HMS.
+  //
+  // This method will fail if the HMS is unreachable, if the table is not a
+  // legacy table, or if the table entry in not in the HMS.
+  Status UpgradeLegacyImpalaTable(const std::string& id,
+                                  const std::string& db_name,
+                                  const std::string& tb_name,
+                                  const Schema& schema) WARN_UNUSED_RESULT;
+
+  // Retrieves all tables in the HMS.
+  //
+  // This method will fail if the HMS is unreachable.
+  Status RetrieveTables(std::vector<hive::Table>* hms_tables) WARN_UNUSED_RESULT;
+
+  // Retrieves notification log events from the HMS.
+  //
+  // The events will begin at id 'last_event_id + 1', and at most 'max_events'
+  // events are returned.
+  Status GetNotificationEvents(int64_t last_event_id, int max_events,
+                               std::vector<hive::NotificationEvent>* events);
 
   // Validates the hive_metastore_uris gflag.
   static bool ValidateUris(const char* flag_name, const std::string& metastore_uris);
@@ -114,17 +140,6 @@ class HmsCatalog {
                               const std::string& master_addresses,
                               hive::Table* table) WARN_UNUSED_RESULT;
 
-  // Creates a table entry in the HMS, or updates that existing entry if the
-  // table already has an entry.
-  //
-  // Instead of only attempting to create or alter a table entry, this method should be
-  // used to ensure the HMS is kept synchronized in as many edge cases as possible.
-  static Status CreateOrUpdateTable(hms::HmsClient* client,
-                                    const std::string& id,
-                                    const std::string& name,
-                                    const Schema& schema,
-                                    const std::string& master_addresses) WARN_UNUSED_RESULT;
-
   // Parses a Kudu table name into a Hive database and table name.
   // Returns an error if the Kudu table name is not correctly formatted.
   static Status ParseTableName(const std::string& table,
@@ -133,6 +148,9 @@ class HmsCatalog {
 
   // Parses a Hive Metastore URI string into a sequence of HostPorts.
   static Status ParseUris(const std::string& metastore_uris, std::vector<HostPort>* hostports);
+
+  // Returns a base environment context for use with calls to the HMS.
+  static hive::EnvironmentContext EnvironmentContext();
 
   // Kudu master addresses.
   const std::string master_addresses_;

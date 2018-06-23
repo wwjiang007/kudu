@@ -22,6 +22,7 @@ import static org.junit.Assert.fail;
 
 import java.util.UUID;
 
+import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Lists;
 import org.apache.hadoop.hive.conf.HiveConf;
 import org.apache.hadoop.hive.metastore.HiveMetaStoreClient;
@@ -44,6 +45,10 @@ import org.junit.Test;
 public class TestKuduMetastorePlugin {
   private static HiveConf clientConf;
   private HiveMetaStoreClient client;
+
+  private EnvironmentContext masterContext() {
+    return new EnvironmentContext(ImmutableMap.of(KuduMetastorePlugin.KUDU_MASTER_EVENT, "true"));
+  }
 
   @BeforeClass
   public static void startMetaStoreServer() throws Exception {
@@ -72,19 +77,21 @@ public class TestKuduMetastorePlugin {
   }
 
   /**
-   * @return a valid Kudu table descriptor.
+   * @return a Kudu table descriptor given the storage handler type.
    */
-  private static Table newTable(String name) {
+  private static Table newKuduTable(String name, String storageHandler) {
     Table table = new Table();
     table.setDbName("default");
     table.setTableName(name);
     table.setTableType(TableType.MANAGED_TABLE.toString());
     table.putToParameters(hive_metastoreConstants.META_TABLE_STORAGE,
-                          KuduMetastorePlugin.KUDU_STORAGE_HANDLER);
-    table.putToParameters(KuduMetastorePlugin.KUDU_TABLE_ID_KEY,
-                          UUID.randomUUID().toString());
-    table.putToParameters(KuduMetastorePlugin.KUDU_MASTER_ADDRS_KEY,
-                          "localhost");
+                          storageHandler);
+    if (!storageHandler.equals(KuduMetastorePlugin.LEGACY_KUDU_STORAGE_HANDLER)) {
+      table.putToParameters(KuduMetastorePlugin.KUDU_TABLE_ID_KEY,
+                            UUID.randomUUID().toString());
+      table.putToParameters(KuduMetastorePlugin.KUDU_MASTER_ADDRS_KEY,
+                           "localhost");
+    }
 
     // The HMS will NPE if the storage descriptor and partition keys aren't set...
     StorageDescriptor sd = new StorageDescriptor();
@@ -99,9 +106,22 @@ public class TestKuduMetastorePlugin {
     return table;
   }
 
+  /**
+   * @return a legacy Kudu table descriptor.
+   */
+  private static Table newLegacyTable(String name) {
+    return newKuduTable(name, KuduMetastorePlugin.LEGACY_KUDU_STORAGE_HANDLER);
+  }
+
+  /**
+   * @return a valid Kudu table descriptor.
+   */
+  private static Table newTable(String name) {
+    return newKuduTable(name, KuduMetastorePlugin.KUDU_STORAGE_HANDLER);
+  }
+
   @Test
   public void testCreateTableHandler() throws Exception {
-
     // A non-Kudu table with a Kudu table ID should be rejected.
     try {
       Table table = newTable("table");
@@ -114,33 +134,30 @@ public class TestKuduMetastorePlugin {
           "non-Kudu table entry must not contain a table ID property"));
     }
 
-    // A non-Kudu table with a Kudu master address should be rejected.
-    try {
-      Table table = newTable("table");
-      table.getParameters().remove(hive_metastoreConstants.META_TABLE_STORAGE);
-      table.getParameters().remove(KuduMetastorePlugin.KUDU_TABLE_ID_KEY);
-      client.createTable(table);
-      fail();
-    } catch (TException e) {
-      assertTrue(e.getMessage().contains(
-          "non-Kudu table entry must not contain a Master addresses property"));
-    }
-
     // A Kudu table without a Kudu table ID.
     try {
       Table table = newTable("table");
       table.getParameters().remove(KuduMetastorePlugin.KUDU_TABLE_ID_KEY);
-      client.createTable(table);
+      client.createTable(table, masterContext());
       fail();
     } catch (TException e) {
       assertTrue(e.getMessage().contains("Kudu table entry must contain a table ID property"));
     }
 
-    // A Kudu table without a master address
+    // A Kudu table without master context.
+    try {
+      Table table = newTable("table");
+      client.createTable(table);
+      fail();
+    } catch (TException e) {
+      assertTrue(e.getMessage().contains("Kudu tables may not be created through Hive"));
+    }
+
+    // A Kudu table without a master address.
     try {
       Table table = newTable("table");
       table.getParameters().remove(KuduMetastorePlugin.KUDU_MASTER_ADDRS_KEY);
-      client.createTable(table);
+      client.createTable(table, masterContext());
       fail();
     } catch (TException e) {
       assertTrue(e.getMessage().contains(
@@ -149,15 +166,17 @@ public class TestKuduMetastorePlugin {
 
     // Check that creating a valid table is accepted.
     Table table = newTable("table");
-    client.createTable(table);
+    client.createTable(table, masterContext());
     client.dropTable(table.getDbName(), table.getTableName());
   }
 
   @Test
   public void testAlterTableHandler() throws Exception {
-    // Test altering a Kudu table.
+    // Test altering a Kudu (or a legacy) table.
     Table table = newTable("table");
-    client.createTable(table);
+    client.createTable(table, masterContext());
+    Table legacyTable = newLegacyTable("legacy_table");
+    client.createTable(legacyTable, masterContext());
     try {
 
       // Try to alter the Kudu table with a different table ID.
@@ -181,6 +200,21 @@ public class TestKuduMetastorePlugin {
 
       // Check that altering the table succeeds.
       client.alter_table(table.getDbName(), table.getTableName(), table);
+
+      // Check that adding a column fails.
+      table.getSd().addToCols(new FieldSchema("b", "int", ""));
+      try {
+        client.alter_table(table.getDbName(), table.getTableName(), table);
+        fail();
+      } catch (TException e) {
+        assertTrue(e.getMessage().contains(
+            "Kudu table columns may not be altered through Hive"));
+      }
+
+      // Check that adding a column succeeds with the master event property set.
+      client.alter_table_with_environmentContext(
+          table.getDbName(), table.getTableName(), table,
+          new EnvironmentContext(ImmutableMap.of(KuduMetastorePlugin.KUDU_MASTER_EVENT, "true")));
     } finally {
       client.dropTable(table.getDbName(), table.getTableName());
     }
@@ -216,6 +250,21 @@ public class TestKuduMetastorePlugin {
 
       // Check that altering the table succeeds.
       client.alter_table(table.getDbName(), table.getTableName(), table);
+
+      // Check that altering the legacy table with Kudu storage handler
+      // succeeds.
+      {
+        Table alteredTable = legacyTable.deepCopy();
+        alteredTable.putToParameters(hive_metastoreConstants.META_TABLE_STORAGE,
+                                     KuduMetastorePlugin.KUDU_STORAGE_HANDLER);
+        alteredTable.putToParameters(KuduMetastorePlugin.KUDU_TABLE_ID_KEY,
+                                     UUID.randomUUID().toString());
+        alteredTable.putToParameters(KuduMetastorePlugin.KUDU_MASTER_ADDRS_KEY,
+                                    "localhost");
+        client.alter_table(legacyTable.getDbName(), legacyTable.getTableName(),
+                           alteredTable);
+      }
+
     } finally {
       client.dropTable(table.getDbName(), table.getTableName());
     }
@@ -225,7 +274,7 @@ public class TestKuduMetastorePlugin {
   public void testDropTableHandler() throws Exception {
     // Test dropping a Kudu table.
     Table table = newTable("table");
-    client.createTable(table);
+    client.createTable(table, masterContext());
     try {
 
       // Test with an invalid table ID.
@@ -247,7 +296,7 @@ public class TestKuduMetastorePlugin {
     }
 
     // Test dropping a Kudu table with the correct ID.
-    client.createTable(table);
+    client.createTable(table, masterContext());
     EnvironmentContext envContext = new EnvironmentContext();
     envContext.putToProperties(KuduMetastorePlugin.KUDU_TABLE_ID_KEY,
                                table.getParameters().get(KuduMetastorePlugin.KUDU_TABLE_ID_KEY));

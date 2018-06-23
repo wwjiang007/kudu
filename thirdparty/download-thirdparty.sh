@@ -73,7 +73,7 @@ fetch_and_expand() {
       echo "Archive $FILENAME already exists. Not re-downloading archive."
     else
       echo "Fetching $FILENAME from $FULL_URL"
-      curl -L -O "$FULL_URL"
+      curl --retry 3 -L -O "$FULL_URL"
     fi
 
     echo "Unpacking $FILENAME to $SOURCE"
@@ -136,13 +136,14 @@ fetch_and_patch() {
 mkdir -p $TP_SOURCE_DIR
 cd $TP_SOURCE_DIR
 
-GLOG_PATCHLEVEL=2
+GLOG_PATCHLEVEL=3
 fetch_and_patch \
  glog-${GLOG_VERSION}.tar.gz \
  $GLOG_SOURCE \
  $GLOG_PATCHLEVEL \
  "patch -p0 < $TP_DIR/patches/glog-issue-198-fix-unused-warnings.patch" \
  "patch -p0 < $TP_DIR/patches/glog-issue-54-dont-build-tests.patch" \
+ "patch -p1 < $TP_DIR/patches/glog-fix-symbolization.patch" \
  "autoreconf -fvi"
 
 GMOCK_PATCHLEVEL=0
@@ -261,7 +262,8 @@ CURL_PATCHLEVEL=0
 fetch_and_patch \
  curl-${CURL_VERSION}.tar.gz \
  $CURL_SOURCE \
- $CURL_PATCHLEVEL
+ $CURL_PATCHLEVEL \
+ "autoreconf -fvi"
 
 CRCUTIL_PATCHLEVEL=1
 fetch_and_patch \

@@ -59,6 +59,7 @@
 #include "kudu/util/fault_injection.h"
 #include "kudu/util/monotime.h"
 #include "kudu/util/net/sockaddr.h"
+#include "kudu/util/net/socket.h"
 #include "kudu/util/path_util.h"
 #include "kudu/util/pb_util.h"
 #include "kudu/util/status.h"
@@ -105,7 +106,7 @@ ExternalMiniClusterOptions::ExternalMiniClusterOptions()
       bind_mode(MiniCluster::kDefaultBindMode),
       num_data_dirs(1),
       enable_kerberos(false),
-      enable_hive_metastore(false),
+      hms_mode(HmsMode::NONE),
       logtostderr(true),
       start_process_timeout(MonoDelta::FromSeconds(30)) {
 }
@@ -185,7 +186,8 @@ Status ExternalMiniCluster::Start() {
                           "could not set krb5 client env");
   }
 
-  if (opts_.enable_hive_metastore) {
+  if (opts_.hms_mode == HmsMode::ENABLE_HIVE_METASTORE ||
+      opts_.hms_mode == HmsMode::ENABLE_METASTORE_INTEGRATION) {
     hms_.reset(new hms::MiniHms());
 
     if (opts_.enable_kerberos) {
@@ -201,17 +203,10 @@ Status ExternalMiniCluster::Start() {
                           "Failed to start the Hive Metastore");
   }
 
-  if (opts_.num_masters != 1) {
-    RETURN_NOT_OK_PREPEND(StartDistributedMasters(),
-                          "Failed to add distributed masters");
-  } else {
-    RETURN_NOT_OK_PREPEND(StartSingleMaster(),
-                          Substitute("Failed to start a single Master"));
-  }
+  RETURN_NOT_OK_PREPEND(StartMasters(), "failed to start masters");
 
   for (int i = 1; i <= opts_.num_tablet_servers; i++) {
-    RETURN_NOT_OK_PREPEND(AddTabletServer(),
-                          Substitute("Failed starting tablet server $0", i));
+    RETURN_NOT_OK_PREPEND(AddTabletServer(), Substitute("failed to start tablet server $0", i));
   }
   RETURN_NOT_OK(WaitForTabletServerCount(
                   opts_.num_tablet_servers,
@@ -239,6 +234,9 @@ void ExternalMiniCluster::ShutdownNodes(ClusterNodes nodes) {
 Status ExternalMiniCluster::Restart() {
   for (const scoped_refptr<ExternalMaster>& master : masters_) {
     if (master && master->IsShutdown()) {
+      if (opts_.hms_mode == HmsMode::ENABLE_METASTORE_INTEGRATION) {
+        master->SetMetastoreIntegration(hms_->uris(), opts_.enable_kerberos);
+      }
       RETURN_NOT_OK_PREPEND(master->Restart(), "Cannot restart master bound at: " +
                                                master->bound_rpc_hostport().ToString());
     }
@@ -256,6 +254,10 @@ Status ExternalMiniCluster::Restart() {
       MonoDelta::FromSeconds(kTabletServerRegistrationTimeoutSeconds)));
 
   return Status::OK();
+}
+
+void ExternalMiniCluster::EnableMetastoreIntegration() {
+  opts_.hms_mode = HmsMode::ENABLE_METASTORE_INTEGRATION;
 }
 
 void ExternalMiniCluster::SetDaemonBinPath(string daemon_bin_path) {
@@ -308,8 +310,7 @@ string ExternalMiniCluster::GetWalPath(const string& daemon_id) const {
 }
 
 namespace {
-vector<string> SubstituteInFlags(const vector<string>& orig_flags,
-                                 int index) {
+vector<string> SubstituteInFlags(const vector<string>& orig_flags, int index) {
   string str_index = strings::Substitute("$0", index);
   vector<string> ret;
   for (const string& orig : orig_flags) {
@@ -317,59 +318,43 @@ vector<string> SubstituteInFlags(const vector<string>& orig_flags,
   }
   return ret;
 }
-
 } // anonymous namespace
 
-Status ExternalMiniCluster::StartSingleMaster() {
-  string daemon_id = "master-0";
-
-  ExternalDaemonOptions opts;
-  opts.messenger = messenger_;
-  opts.exe = GetBinaryPath(kMasterBinaryName);
-  opts.wal_dir = GetWalPath(daemon_id);
-  opts.data_dirs = GetDataPaths(daemon_id);
-  opts.log_dir = GetLogPath(daemon_id);
-  opts.block_manager_type = opts_.block_manager_type;
-  if (FLAGS_perf_record) {
-    opts.perf_record_filename =
-        Substitute("$0/perf-$1.data", opts.log_dir, daemon_id);
-  }
-  opts.extra_flags = SubstituteInFlags(opts_.extra_master_flags, 0);
-  opts.start_process_timeout = opts_.start_process_timeout;
-  opts.logtostderr = opts_.logtostderr;
-
-  opts.rpc_bind_address = HostPort(GetBindIpForMaster(0), 0);
-  if (opts_.enable_hive_metastore) {
-    opts.extra_flags.emplace_back(Substitute("--hive_metastore_uris=$0", hms_->uris()));
-    opts.extra_flags.emplace_back(Substitute("--hive_metastore_sasl_enabled=$0",
-                                             opts_.enable_kerberos));
-  }
-  scoped_refptr<ExternalMaster> master = new ExternalMaster(opts);
-  if (opts_.enable_kerberos) {
-    // The bind host here is the hostname that will be used to generate the
-    // Kerberos principal, so it has to match the bind address for the master
-    // rpc endpoint.
-    RETURN_NOT_OK_PREPEND(master->EnableKerberos(kdc_.get(), opts.rpc_bind_address.host()),
-                          "could not enable Kerberos");
-  }
-
-  RETURN_NOT_OK(master->Start());
-  masters_.push_back(master);
-  return Status::OK();
-}
-
-Status ExternalMiniCluster::StartDistributedMasters() {
+Status ExternalMiniCluster::StartMasters() {
   int num_masters = opts_.num_masters;
 
-  if (opts_.master_rpc_ports.size() != num_masters) {
-    LOG(FATAL) << num_masters << " masters requested, but only " <<
-        opts_.master_rpc_ports.size() << " ports specified in 'master_rpc_ports'";
+  // Collect and keep alive the set of master sockets bound with SO_REUSEPORT
+  // until all master proccesses are started. This allows the mini-cluster to
+  // reserve a set of ports up front, then later start the set of masters, each
+  // configured with the full set of ports.
+  //
+  // TODO(dan): re-bind the ports between node restarts in order to prevent other
+  // processess from binding to them in the interim.
+  vector<unique_ptr<Socket>> reserved_sockets;
+  vector<HostPort> master_rpc_addrs;
+
+  if (!opts_.master_rpc_addresses.empty()) {
+    CHECK_EQ(opts_.master_rpc_addresses.size(), num_masters);
+    master_rpc_addrs = opts_.master_rpc_addresses;
+  } else {
+    for (int i = 0; i < num_masters; i++) {
+      unique_ptr<Socket> reserved_socket;
+      RETURN_NOT_OK_PREPEND(ReserveDaemonSocket(MiniCluster::MASTER, i, opts_.bind_mode,
+                                                &reserved_socket),
+                            "failed to reserve master socket address");
+      Sockaddr addr;
+      RETURN_NOT_OK(reserved_socket->GetSocketAddress(&addr));
+      master_rpc_addrs.emplace_back(addr.host(), addr.port());
+      reserved_sockets.emplace_back(std::move(reserved_socket));
+    }
   }
 
-  vector<HostPort> peer_hostports = master_rpc_addrs();
   vector<string> flags = opts_.extra_master_flags;
-  flags.push_back(Substitute("--master_addresses=$0",
-                             HostPort::ToCommaSeparatedString(peer_hostports)));
+  flags.emplace_back("--rpc_reuseport=true");
+  if (num_masters > 1) {
+    flags.emplace_back(Substitute("--master_addresses=$0",
+                                  HostPort::ToCommaSeparatedString(master_rpc_addrs)));
+  }
   string exe = GetBinaryPath(kMasterBinaryName);
 
   // Start the masters.
@@ -389,8 +374,8 @@ Status ExternalMiniCluster::StartDistributedMasters() {
     }
     opts.extra_flags = SubstituteInFlags(flags, i);
     opts.start_process_timeout = opts_.start_process_timeout;
-    opts.rpc_bind_address = peer_hostports[i];
-    if (opts_.enable_hive_metastore) {
+    opts.rpc_bind_address = master_rpc_addrs[i];
+    if (opts_.hms_mode == HmsMode::ENABLE_METASTORE_INTEGRATION) {
       opts.extra_flags.emplace_back(Substitute("--hive_metastore_uris=$0", hms_->uris()));
       opts.extra_flags.emplace_back(Substitute("--hive_metastore_sasl_enabled=$0",
                                                opts_.enable_kerberos));
@@ -399,12 +384,12 @@ Status ExternalMiniCluster::StartDistributedMasters() {
 
     scoped_refptr<ExternalMaster> peer = new ExternalMaster(opts);
     if (opts_.enable_kerberos) {
-      RETURN_NOT_OK_PREPEND(peer->EnableKerberos(kdc_.get(), peer_hostports[i].host()),
+      RETURN_NOT_OK_PREPEND(peer->EnableKerberos(kdc_.get(), master_rpc_addrs[i].host()),
                             "could not enable Kerberos");
     }
     RETURN_NOT_OK_PREPEND(peer->Start(),
                           Substitute("Unable to start Master at index $0", i));
-    masters_.push_back(peer);
+    masters_.emplace_back(std::move(peer));
   }
 
   return Status::OK();
@@ -425,10 +410,7 @@ Status ExternalMiniCluster::AddTabletServer() {
   int idx = tablet_servers_.size();
   string daemon_id = Substitute("ts-$0", idx);
 
-  vector<HostPort> master_hostports;
-  for (int i = 0; i < num_masters(); i++) {
-    master_hostports.push_back(DCHECK_NOTNULL(master(i))->bound_rpc_hostport());
-  }
+  vector<HostPort> master_hostports = master_rpc_addrs();
   string bind_host = GetBindIpForTabletServer(idx);
 
   ExternalDaemonOptions opts;
@@ -447,8 +429,7 @@ Status ExternalMiniCluster::AddTabletServer() {
   opts.rpc_bind_address = HostPort(bind_host, 0);
   opts.logtostderr = opts_.logtostderr;
 
-  scoped_refptr<ExternalTabletServer> ts =
-      new ExternalTabletServer(opts, master_hostports);
+  scoped_refptr<ExternalTabletServer> ts = new ExternalTabletServer(opts, master_hostports);
   if (opts_.enable_kerberos) {
     RETURN_NOT_OK_PREPEND(ts->EnableKerberos(kdc_.get(), bind_host),
                           "could not enable Kerberos");
@@ -637,17 +618,11 @@ vector<ExternalDaemon*> ExternalMiniCluster::daemons() const {
 }
 
 vector<HostPort> ExternalMiniCluster::master_rpc_addrs() const {
-  if (opts_.num_masters == 1) {
-    const auto& addr = CHECK_NOTNULL(master(0))->bound_rpc_addr();
-    return { HostPort(addr.host(), addr.port()) };
+  vector<HostPort> master_hostports;
+  for (const auto& master : masters_) {
+    master_hostports.emplace_back(master->bound_rpc_hostport());
   }
-  vector<HostPort> master_rpc_addrs;
-  for (int i = 0; i < opts_.master_rpc_ports.size(); i++) {
-    master_rpc_addrs.emplace_back(
-        GetBindIpForDaemon(MiniCluster::MASTER, i, opts_.bind_mode),
-        opts_.master_rpc_ports[i]);
-  }
-  return master_rpc_addrs;
+  return master_hostports;
 }
 
 std::shared_ptr<rpc::Messenger> ExternalMiniCluster::messenger() const {
@@ -889,6 +864,13 @@ Status ExternalDaemon::StartProcess(const vector<string>& user_flags) {
 void ExternalDaemon::SetExePath(string exe) {
   CHECK(IsShutdown()) << "Call Shutdown() before changing the executable path";
   opts_.exe = std::move(exe);
+}
+
+void ExternalDaemon::SetMetastoreIntegration(const string& hms_uris,
+                                             bool enable_kerberos) {
+  opts_.extra_flags.emplace_back(Substitute("--hive_metastore_uris=$0", hms_uris));
+  opts_.extra_flags.emplace_back(Substitute("--hive_metastore_sasl_enabled=$0",
+                                            enable_kerberos));
 }
 
 Status ExternalDaemon::Pause() {

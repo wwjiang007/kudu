@@ -53,7 +53,7 @@
 // Default to 100 MiB to match Thrift TSaslTransport.receiveSaslMessage and the
 // HMS metastore.server.max.message.size config.
 DEFINE_int32(hms_client_max_buf_size, 100 * 1024 * 1024,
-             "Maximum size of Hive MetaStore objects that can be received by the "
+             "Maximum size of Hive Metastore objects that can be received by the "
              "HMS client in bytes.");
 TAG_FLAG(hms_client_max_buf_size, experimental);
 // Note: despite being marked as a runtime flag, the new buf size value will
@@ -112,8 +112,13 @@ namespace hms {
     return Status::RuntimeError((msg), e.what()); \
   }
 
+const char* const HmsClient::kLegacyKuduStorageHandler =
+  "com.cloudera.kudu.hive.KuduStorageHandler";
+const char* const HmsClient::kLegacyKuduTableNameKey = "kudu.table_name";
+const char* const HmsClient::kLegacyTablePrefix = "impala::";
 const char* const HmsClient::kKuduTableIdKey = "kudu.table_id";
 const char* const HmsClient::kKuduMasterAddrsKey = "kudu.master_addresses";
+const char* const HmsClient::kKuduMasterEventKey = "kudu.master_event";
 const char* const HmsClient::kKuduStorageHandler = "org.apache.kudu.hive.KuduStorageHandler";
 
 const char* const HmsClient::kTransactionalEventListeners =
@@ -122,11 +127,13 @@ const char* const HmsClient::kDisallowIncompatibleColTypeChanges =
   "hive.metastore.disallow.incompatible.col.type.changes";
 const char* const HmsClient::kDbNotificationListener =
   "org.apache.hive.hcatalog.listener.DbNotificationListener";
+const char* const HmsClient::kExternalTableKey = "EXTERNAL";
 const char* const HmsClient::kStorageHandlerKey = "storage_handler";
 const char* const HmsClient::kKuduMetastorePlugin =
   "org.apache.kudu.hive.metastore.KuduMetastorePlugin";
 
 const char* const HmsClient::kManagedTable = "MANAGED_TABLE";
+const char* const HmsClient::kExternalTable = "EXTERNAL_TABLE";
 
 const uint16_t HmsClient::kDefaultHmsPort = 9083;
 
@@ -175,13 +182,13 @@ HmsClient::~HmsClient() {
 Status HmsClient::Start() {
   SCOPED_LOG_SLOW_EXECUTION(WARNING, kSlowExecutionWarningThresholdMs, "starting HMS client");
   HMS_RET_NOT_OK(client_.getOutputProtocol()->getTransport()->open(),
-                 "failed to open Hive MetaStore connection");
+                 "failed to open Hive Metastore connection");
 
   // Immediately after connecting to the HMS, check that it is configured with
   // the required event listeners.
   string event_listener_config;
   HMS_RET_NOT_OK(client_.get_config_value(event_listener_config, kTransactionalEventListeners, ""),
-                 Substitute("failed to get Hive MetaStore $0 configuration",
+                 Substitute("failed to get Hive Metastore $0 configuration",
                             kTransactionalEventListeners));
 
   // Parse the set of listeners from the configuration string.
@@ -213,7 +220,7 @@ Status HmsClient::Start() {
   HMS_RET_NOT_OK(client_.get_config_value(disallow_incompatible_column_type_changes,
                                           kDisallowIncompatibleColTypeChanges,
                                           "false"),
-                 Substitute("failed to get Hive MetaStore $0 configuration",
+                 Substitute("failed to get Hive Metastore $0 configuration",
                             kDisallowIncompatibleColTypeChanges));
 
   if (boost::iequals(disallow_incompatible_column_type_changes, "true")) {
@@ -228,7 +235,7 @@ Status HmsClient::Start() {
 Status HmsClient::Stop() {
   SCOPED_LOG_SLOW_EXECUTION(WARNING, kSlowExecutionWarningThresholdMs, "stopping HMS client");
   HMS_RET_NOT_OK(client_.getInputProtocol()->getTransport()->close(),
-                 "failed to close Hive MetaStore connection");
+                 "failed to close Hive Metastore connection");
   return Status::OK();
 }
 
@@ -238,14 +245,14 @@ bool HmsClient::IsConnected() {
 
 Status HmsClient::CreateDatabase(const hive::Database& database) {
   SCOPED_LOG_SLOW_EXECUTION(WARNING, kSlowExecutionWarningThresholdMs, "create HMS database");
-  HMS_RET_NOT_OK(client_.create_database(database), "failed to create Hive MetaStore database");
+  HMS_RET_NOT_OK(client_.create_database(database), "failed to create Hive Metastore database");
   return Status::OK();
 }
 
 Status HmsClient::DropDatabase(const string& database_name, Cascade cascade) {
   SCOPED_LOG_SLOW_EXECUTION(WARNING, kSlowExecutionWarningThresholdMs, "drop HMS database");
   HMS_RET_NOT_OK(client_.drop_database(database_name, true, cascade == Cascade::kTrue),
-                 "failed to drop Hive MetaStore database");
+                 "failed to drop Hive Metastore database");
   return Status::OK();
 }
 
@@ -253,7 +260,7 @@ Status HmsClient::GetAllDatabases(vector<string>* databases) {
   DCHECK(databases);
   SCOPED_LOG_SLOW_EXECUTION(WARNING, kSlowExecutionWarningThresholdMs, "get all HMS databases");
   HMS_RET_NOT_OK(client_.get_all_databases(*databases),
-                 "failed to get Hive MetaStore databases");
+                 "failed to get Hive Metastore databases");
   return Status::OK();
 }
 
@@ -261,32 +268,35 @@ Status HmsClient::GetDatabase(const string& pattern, hive::Database* database) {
   DCHECK(database);
   SCOPED_LOG_SLOW_EXECUTION(WARNING, kSlowExecutionWarningThresholdMs, "get HMS database");
   HMS_RET_NOT_OK(client_.get_database(*database, pattern),
-                 "failed to get Hive MetaStore database");
+                 "failed to get Hive Metastore database");
   return Status::OK();
 }
 
-Status HmsClient::CreateTable(const hive::Table& table) {
+Status HmsClient::CreateTable(const hive::Table& table, const hive::EnvironmentContext& env_ctx) {
   SCOPED_LOG_SLOW_EXECUTION(WARNING, kSlowExecutionWarningThresholdMs, "create HMS table");
-  HMS_RET_NOT_OK(client_.create_table(table), "failed to create Hive MetaStore table");
+  HMS_RET_NOT_OK(client_.create_table_with_environment_context(table, env_ctx),
+                 "failed to create Hive MetaStore table");
   return Status::OK();
 }
 
 Status HmsClient::AlterTable(const std::string& database_name,
                              const std::string& table_name,
-                             const hive::Table& table) {
+                             const hive::Table& table,
+                             const hive::EnvironmentContext& env_ctx) {
   SCOPED_LOG_SLOW_EXECUTION(WARNING, kSlowExecutionWarningThresholdMs, "alter HMS table");
-  HMS_RET_NOT_OK(client_.alter_table(database_name, table_name, table),
+  HMS_RET_NOT_OK(client_.alter_table_with_environment_context(database_name, table_name,
+                                                              table, env_ctx),
                  "failed to alter Hive MetaStore table");
   return Status::OK();
 }
 
-Status HmsClient::DropTableWithContext(const string& database_name,
-                                       const string& table_name,
-                                       const hive::EnvironmentContext& env_ctx) {
+Status HmsClient::DropTable(const string& database_name,
+                            const string& table_name,
+                            const hive::EnvironmentContext& env_ctx) {
   SCOPED_LOG_SLOW_EXECUTION(WARNING, kSlowExecutionWarningThresholdMs, "drop HMS table");
   HMS_RET_NOT_OK(client_.drop_table_with_environment_context(database_name, table_name,
                                                              true, env_ctx),
-                 "failed to drop Hive MetaStore table");
+                 "failed to drop Hive Metastore table");
   return Status::OK();
 }
 
@@ -295,7 +305,7 @@ Status HmsClient::GetAllTables(const string& database_name,
   DCHECK(tables);
   SCOPED_LOG_SLOW_EXECUTION(WARNING, kSlowExecutionWarningThresholdMs, "get all HMS tables");
   HMS_RET_NOT_OK(client_.get_all_tables(*tables, database_name),
-                 "failed to get Hive MetaStore tables");
+                 "failed to get Hive Metastore tables");
   return Status::OK();
 }
 
@@ -305,7 +315,7 @@ Status HmsClient::GetTable(const string& database_name,
   DCHECK(table);
   SCOPED_LOG_SLOW_EXECUTION(WARNING, kSlowExecutionWarningThresholdMs, "get HMS table");
   HMS_RET_NOT_OK(client_.get_table(*table, database_name, table_name),
-                 "failed to get Hive MetaStore table");
+                 "failed to get Hive Metastore table");
   return Status::OK();
 }
 
@@ -315,7 +325,7 @@ Status HmsClient::GetCurrentNotificationEventId(int64_t* event_id) {
                             "get HMS current notification event ID");
   hive::CurrentNotificationEventId response;
   HMS_RET_NOT_OK(client_.get_current_notificationEventId(response),
-                 "failed to get Hive MetaStore current event ID");
+                 "failed to get Hive Metastore current event ID");
   *event_id = response.eventId;
   return Status::OK();
 }
@@ -331,7 +341,7 @@ Status HmsClient::GetNotificationEvents(int64_t last_event_id,
   request.__set_maxEvents(max_events);
   hive::NotificationEventResponse response;
   HMS_RET_NOT_OK(client_.get_next_notification(response, request),
-                 "failed to get Hive MetaStore next notification");
+                 "failed to get Hive Metastore next notification");
   events->swap(response.events);
   return Status::OK();
 }
@@ -348,7 +358,7 @@ Status HmsClient::AddPartitions(const string& database_name,
   request.parts = std::move(partitions);
 
   HMS_RET_NOT_OK(client_.add_partitions_req(response, request),
-                 "failed to add Hive MetaStore table partitions");
+                 "failed to add Hive Metastore table partitions");
   return Status::OK();
 }
 

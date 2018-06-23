@@ -97,7 +97,6 @@
 #include "kudu/util/status_callback.h"
 #include "kudu/util/trace.h"
 #include "kudu/util/trace_metrics.h"
-#include "kudu/util/website_util.h"
 
 DEFINE_int32(scanner_default_batch_size_bytes, 1024 * 1024,
              "The default size for batches of scan results");
@@ -858,9 +857,7 @@ void TabletServiceImpl::Write(const WriteRequestPB* req,
   double capacity_pct;
   if (process_memory::SoftLimitExceeded(&capacity_pct)) {
     tablet->metrics()->leader_memory_pressure_rejections->Increment();
-    string msg = StringPrintf(
-        "Soft memory limit exceeded (at %.2f%% of capacity). See %s",
-        capacity_pct, KuduDocsTroubleshootingUrl().c_str());
+    string msg = StringPrintf("Soft memory limit exceeded (at %.2f%% of capacity)", capacity_pct);
     if (capacity_pct >= FLAGS_memory_limit_warn_threshold_percentage) {
       KLOG_EVERY_N_SECS(WARNING, 1) << "Rejecting Write request: " << msg << THROTTLE_MSG;
     } else {
@@ -1013,7 +1010,10 @@ void ConsensusServiceImpl::RequestConsensusVote(const VoteRequestPB* req,
   shared_ptr<RaftConsensus> consensus;
   if (!GetConsensusOrRespond(replica, resp, context, &consensus)) return;
 
-  Status s = consensus->RequestVote(req, std::move(last_logged_opid), resp);
+  Status s = consensus->RequestVote(req,
+                                    consensus::TabletVotingState(std::move(last_logged_opid),
+                                                                 data_state),
+                                    resp);
   if (PREDICT_FALSE(!s.ok())) {
     SetupErrorAndRespond(resp->mutable_error(), s,
                          TabletServerErrorPB::UNKNOWN_ERROR,
@@ -1086,11 +1086,13 @@ void ConsensusServiceImpl::UnsafeChangeConfig(const UnsafeChangeConfigRequestPB*
   }
 
   shared_ptr<RaftConsensus> consensus;
-  if (!GetConsensusOrRespond(replica, resp, context, &consensus)) return;
-  TabletServerErrorPB::Code error_code;
-  Status s = consensus->UnsafeChangeConfig(*req, &error_code);
+  if (!GetConsensusOrRespond(replica, resp, context, &consensus)) {
+    return;
+  }
+  boost::optional<TabletServerErrorPB::Code> error_code;
+  const Status s = consensus->UnsafeChangeConfig(*req, &error_code);
   if (PREDICT_FALSE(!s.ok())) {
-    SetupErrorAndRespond(resp->mutable_error(), s, error_code, context);
+    HandleErrorResponse(req, resp, context, error_code, s);
     return;
   }
   context->RespondSuccess();

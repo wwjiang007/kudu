@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <iosfwd>
 #include <memory>
@@ -42,6 +43,7 @@
 #include "kudu/gutil/macros.h"
 #include "kudu/gutil/port.h"
 #include "kudu/gutil/ref_counted.h"
+#include "kudu/tablet/metadata.pb.h"
 #include "kudu/tserver/tserver.pb.h"
 #include "kudu/util/atomic.h"
 #include "kudu/util/locks.h"
@@ -56,10 +58,9 @@ namespace kudu {
 typedef std::lock_guard<simple_spinlock> Lock;
 typedef gscoped_ptr<Lock> ScopedLock;
 
+class Status;
 class ThreadPool;
 class ThreadPoolToken;
-class Status;
-
 template <typename Sig>
 class Callback;
 
@@ -71,16 +72,24 @@ namespace consensus {
 
 class ConsensusMetadataManager;
 class ConsensusRound;
-class PeerProxyFactory;
 class PeerManager;
+class PeerProxyFactory;
 class PendingRounds;
 class ReplicaTransactionFactory;
-
 struct ConsensusBootstrapInfo;
 struct ElectionResult;
 
 struct ConsensusOptions {
   std::string tablet_id;
+};
+
+struct TabletVotingState {
+  boost::optional<OpId> tombstone_last_logged_opid_;
+  tablet::TabletDataState data_state_;
+  TabletVotingState(boost::optional<OpId> tombstone_last_logged_opid,
+                    tablet::TabletDataState data_state)
+          : tombstone_last_logged_opid_(std::move(tombstone_last_logged_opid)),
+            data_state_(data_state) {}
 };
 
 typedef int64_t ConsensusTerm;
@@ -250,7 +259,7 @@ class RaftConsensus : public std::enable_shared_from_this<RaftConsensus>,
   // in kInitialized and kStopped states, instead of just in the kRunning
   // state.
   Status RequestVote(const VoteRequestPB* request,
-                     boost::optional<OpId> tombstone_last_logged_opid,
+                     TabletVotingState tablet_voting_state,
                      VoteResponsePB* response);
 
   // Implement a ChangeConfig() request.
@@ -265,7 +274,7 @@ class RaftConsensus : public std::enable_shared_from_this<RaftConsensus>,
 
   // Implement an UnsafeChangeConfig() request.
   Status UnsafeChangeConfig(const UnsafeChangeConfigRequestPB& req,
-                            tserver::TabletServerErrorPB::Code* error_code);
+                            boost::optional<tserver::TabletServerErrorPB::Code>* error_code);
 
   // Returns the last OpId (either received or committed, depending on the
   // 'type' argument) that the Consensus implementation knows about.
@@ -348,6 +357,8 @@ class RaftConsensus : public std::enable_shared_from_this<RaftConsensus>,
 
   // Return the on-disk size of the consensus metadata, in bytes.
   int64_t MetadataOnDiskSize() const;
+
+  int64_t GetMillisSinceLastLeaderHeartbeat() const;
 
  protected:
   RaftConsensus(ConsensusOptions options,
@@ -839,7 +850,7 @@ class RaftConsensus : public std::enable_shared_from_this<RaftConsensus>,
   // The number of times this node has called and lost a leader election since
   // the last time it saw a stable leader (either itself or another node).
   // This is used to calculate back-off of the election timeout.
-  int failed_elections_since_stable_leader_;
+  int64_t failed_elections_since_stable_leader_;
 
   Callback<void(const std::string& reason)> mark_dirty_clbk_;
 
@@ -851,8 +862,13 @@ class RaftConsensus : public std::enable_shared_from_this<RaftConsensus>,
   // The number of times Update() has been called, used for some test assertions.
   AtomicInt<int32_t> update_calls_for_tests_;
 
+  FunctionGaugeDetacher metric_detacher_;
+
+  std::atomic<int64_t> last_leader_communication_time_micros_;
+
   scoped_refptr<Counter> follower_memory_pressure_rejections_;
-  scoped_refptr<AtomicGauge<int64_t> > term_metric_;
+  scoped_refptr<AtomicGauge<int64_t>> term_metric_;
+  scoped_refptr<AtomicGauge<int64_t>> num_failed_elections_metric_;
 
   DISALLOW_COPY_AND_ASSIGN(RaftConsensus);
 };

@@ -62,7 +62,7 @@ struct HmsClientOptions {
   bool enable_kerberos = false;
 };
 
-// A client for the Hive MetaStore.
+// A client for the Hive Metastore.
 //
 // All operations are synchronous, and may block.
 //
@@ -87,8 +87,13 @@ struct HmsClientOptions {
 class HmsClient {
  public:
 
+  static const char* const kExternalTableKey;
+  static const char* const kLegacyKuduStorageHandler;
+  static const char* const kLegacyKuduTableNameKey;
+  static const char* const kLegacyTablePrefix;
   static const char* const kKuduTableIdKey;
   static const char* const kKuduMasterAddrsKey;
+  static const char* const kKuduMasterEventKey;;
   static const char* const kStorageHandlerKey;
   static const char* const kKuduStorageHandler;
 
@@ -99,6 +104,7 @@ class HmsClient {
 
   // See org.apache.hadoop.hive.metastore.TableType.
   static const char* const kManagedTable;
+  static const char* const kExternalTable;
 
   static const uint16_t kDefaultHmsPort;
 
@@ -147,17 +153,22 @@ class HmsClient {
   Status GetDatabase(const std::string& pattern, hive::Database* database) WARN_UNUSED_RESULT;
 
   // Creates a table in the HMS.
-  Status CreateTable(const hive::Table& table) WARN_UNUSED_RESULT;
+  Status CreateTable(const hive::Table& table,
+                     const hive::EnvironmentContext& env_ctx = hive::EnvironmentContext())
+    WARN_UNUSED_RESULT;
 
   // Alter a table in the HMS.
   Status AlterTable(const std::string& database_name,
                     const std::string& table_name,
-                    const hive::Table& table) WARN_UNUSED_RESULT;
+                    const hive::Table& table,
+                    const hive::EnvironmentContext& env_ctx = hive::EnvironmentContext())
+    WARN_UNUSED_RESULT;
 
   // Drops a Kudu table in the HMS.
-  Status DropTableWithContext(const std::string& database_name,
-                              const std::string& table_name,
-                              const hive::EnvironmentContext& env_ctx) WARN_UNUSED_RESULT;
+  Status DropTable(const std::string& database_name,
+                   const std::string& table_name,
+                   const hive::EnvironmentContext& env_ctx = hive::EnvironmentContext())
+    WARN_UNUSED_RESULT;
 
   // Retrieves an HMS table metadata.
   Status GetTable(const std::string& database_name,

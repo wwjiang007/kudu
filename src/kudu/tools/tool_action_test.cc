@@ -34,6 +34,7 @@
 
 #include "kudu/common/common.pb.h"
 #include "kudu/common/wire_protocol.h"
+#include "kudu/gutil/macros.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/mini-cluster/external_mini_cluster.h"
 #include "kudu/security/test/mini_kdc.h"
@@ -157,7 +158,7 @@ Status ProcessRequest(const ControlShellRequestPB& req,
         opts.num_tablet_servers = cc.num_tservers();
       }
       opts.enable_kerberos = cc.enable_kerberos();
-      opts.enable_hive_metastore = cc.enable_hive_metastore();
+      opts.hms_mode = cc.hms_mode();
       if (cc.has_cluster_root()) {
         opts.cluster_root = cc.cluster_root();
       } else {
@@ -167,9 +168,6 @@ Status ProcessRequest(const ControlShellRequestPB& req,
                                      cc.extra_master_flags().end());
       opts.extra_tserver_flags.assign(cc.extra_tserver_flags().begin(),
                                       cc.extra_tserver_flags().end());
-      if (opts.num_masters > 1) {
-        opts.master_rpc_ports = { 11030, 11031, 11032 };
-      }
       if (opts.enable_kerberos) {
         opts.mini_kdc_options.data_root = JoinPathSegments(opts.cluster_root, "krb5kdc");
         opts.mini_kdc_options.ticket_lifetime = cc.mini_kdc_options().ticket_lifetime();
@@ -301,9 +299,12 @@ Status RunControlShell(const RunnerContext& /*context*/) {
   // Because we use stdin and stdout to communicate with the shell's parent,
   // it's critical that none of our subprocesses write to stdout. To that end,
   // the protocol will use stdout via another fd, and we'll redirect fd 1 to stderr.
-  int new_stdout = dup(STDOUT_FILENO);
-  PCHECK(new_stdout != -1);
-  PCHECK(dup2(STDERR_FILENO, STDOUT_FILENO) == STDOUT_FILENO);
+  int new_stdout;
+  RETRY_ON_EINTR(new_stdout, dup(STDOUT_FILENO));
+  CHECK_ERR(new_stdout);
+  int ret;
+  RETRY_ON_EINTR(ret, dup2(STDERR_FILENO, STDOUT_FILENO));
+  PCHECK(ret == STDOUT_FILENO);
   ControlShellProtocol::SerializationMode serde_mode;
   if (boost::iequals(FLAGS_serialization, "json")) {
     serde_mode = ControlShellProtocol::SerializationMode::JSON;

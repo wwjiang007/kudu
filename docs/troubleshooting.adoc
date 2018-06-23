@@ -532,6 +532,16 @@ are several ways to relieve the memory pressure on Kudu:
   Generally, the recommended ratio of maintenance manager threads to data directories is 1:3.
 - Reduce the volume of writes flowing to Kudu on the application side.
 
+Finally, check the value of `--block_cache_capacity_mb`. This setting determines
+the maximum size of Kudu's block cache. While a higher value can help with read
+and write performance, setting it too high (as a percentage of `--memory_limit_hard_bytes`)
+is harmful. Do not raise `--block_cache_capacity_mb` above `--memory_pressure_percentage`
+(default 60%) of `--memory_limit_hard_bytes`, as this will cause Kudu to flush
+aggressively even if write throughput is low. Keeping the block cache capacity
+below 50% of the memory pressure percentage times the hard limit is recommended.
+With the defaults, this means the `--block_cache_capacity_mb` should not exceed
+30% of `--memory_limit_hard_bytes`.
+
 [[heap_sampling]]
 === Heap Sampling
 
@@ -566,6 +576,18 @@ TIP: Heap samples contain only summary information about allocations and do not 
 _data_ from the heap. It is safe to share heap samples in public without fear of exposing
 confidential or sensitive data.
 
+[[slow_dns_nscd]]
+=== Slow DNS Lookups and `nscd`
+
+If the logs contain messages about slow name resolution like
+
+----
+W0926 11:19:01.339553 27231 net_util.cc:129] Time spent resolving address for kudu-tserver.example.com: real 4.647s    user 0.000s     sys 0.000s
+----
+
+then it may help to run `nscd` (the name service cache daemon). Consult your
+operating system's documentation for how to install and enable `nscd`.
+
 == Issues using Kudu
 
 [[hive_handler]]
@@ -592,3 +614,19 @@ link:http://kudu.apache.org/releases/[releases page] has links to documentation
 for previous versions of Kudu; for the latest release, see the
 link:known_issues.html[known issues page].
 
+[[tombstoned_or_stopped_tablets]]
+=== Tombstoned or STOPPED tablet replicas
+
+Users may notice some replicas on a tablet server are in a STOPPED state, and
+remain on the server indefinitely. These replicas are tombstones. A tombstone
+indicates that the tablet server once held a bona fide replica of its tablet.
+For example, if a tablet server goes down and its replicas are re-replicated
+elsewhere, if the tablet server rejoins the cluster its replicas will become
+tombstones. A tombstone will remain until the table it belongs to is deleted, or
+a new replica of the same tablet is placed on the tablet server. A count of
+tombstoned replicas and details of each one are available on the /tablets page
+of the tablet server web UI.
+
+The Raft consensus algorithm that Kudu uses for replication requires tombstones
+for correctness in certain rare situations. They consume minimal resources and
+hold no data. They must not be deleted.

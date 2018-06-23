@@ -20,6 +20,8 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 #include <gflags/gflags_declare.h>
@@ -27,6 +29,7 @@
 
 #include "kudu/common/common.pb.h"
 #include "kudu/common/schema.h"
+#include "kudu/gutil/map-util.h" // IWYU pragma: keep
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/hms/hive_metastore_types.h"
 #include "kudu/hms/hms_client.h"
@@ -42,6 +45,7 @@ DECLARE_string(hive_metastore_uris);
 DECLARE_bool(hive_metastore_sasl_enabled);
 
 using kudu::rpc::SaslProtection;
+using std::make_pair;
 using std::string;
 using std::unique_ptr;
 using std::vector;
@@ -215,6 +219,36 @@ class HmsCatalogTest : public KuduTest {
     }
   }
 
+  Status CreateLegacyTable(const string& database_name,
+                           const string& table_name,
+                           const string& table_type) {
+    hive::Table table;
+    string kudu_table_name(table_name);
+    table.dbName = database_name;
+    table.tableName = table_name;
+    table.tableType = table_type;
+    if (table_type == HmsClient::kManagedTable) {
+      kudu_table_name = Substitute("$0$1.$2", HmsClient::kLegacyTablePrefix,
+                                   database_name, table_name);
+    }
+
+    table.__set_parameters({
+        make_pair(HmsClient::kStorageHandlerKey,
+                  HmsClient::kLegacyKuduStorageHandler),
+        make_pair(HmsClient::kLegacyKuduTableNameKey,
+                  kudu_table_name),
+        make_pair(HmsClient::kKuduMasterAddrsKey,
+                  kMasterAddrs),
+    });
+
+    // TODO(Hao): Remove this once HIVE-19253 is fixed.
+    if (table_type == HmsClient::kExternalTable) {
+      table.parameters[HmsClient::kExternalTableKey] = "TRUE";
+    }
+
+    return hms_client_->CreateTable(table);
+  }
+
   void CheckTableDoesNotExist(const string& database_name, const string& table_name) {
     hive::Table table;
     Status s = hms_client_->GetTable(database_name, table_name, &table);
@@ -256,14 +290,8 @@ TEST_P(HmsCatalogTestParameterized, TestTableLifecycle) {
   ASSERT_OK(hms_catalog_->CreateTable(kTableId, kTableName, schema));
   NO_FATALS(CheckTable(kHmsDatabase, kHmsTableName, kTableId, schema));
 
-  // Create the table again. This should succeed since the table ID matches. The
-  // HMS catalog will automatically short-circuit creating the table.
-  // TODO(dan): once we have HMS catalog stats, assert that the op short circuits.
-  ASSERT_OK(hms_catalog_->CreateTable(kTableId, kTableName, schema));
-  NO_FATALS(CheckTable(kHmsDatabase, kHmsTableName, kTableId, schema));
-
-  // Create the table again, but with a different table ID.
-  Status s = hms_catalog_->CreateTable("new-table-id", kTableName, schema);
+  // Create the table again, and check that the expected failure occurs.
+  Status s = hms_catalog_->CreateTable(kTableId, kTableName, schema);
   ASSERT_TRUE(s.IsAlreadyPresent()) << s.ToString();
   NO_FATALS(CheckTable(kHmsDatabase, kHmsTableName, kTableId, schema));
 
@@ -279,35 +307,6 @@ TEST_P(HmsCatalogTestParameterized, TestTableLifecycle) {
   ASSERT_OK(hms_catalog_->DropTable(kTableId, kAlteredTableName));
   NO_FATALS(CheckTableDoesNotExist(kHmsDatabase, kHmsTableName));
   NO_FATALS(CheckTableDoesNotExist(kHmsDatabase, kHmsAlteredTableName));
-}
-
-// Checks that 'legacy' Kudu tables can be altered and dropped by the
-// HmsCatalog. Altering a legacy table to be HMS compliant should result in a
-// valid HMS table entry being created. Dropping a legacy table should do
-// nothing, but return success.
-TEST_F(HmsCatalogTest, TestLegacyTables) {
-  const string kTableId = "table-id";
-  const string kHmsDatabase = "default";
-
-  Schema schema = AllTypesSchema();
-  hive::Table table;
-
-  // Alter a table containing a non Hive-compatible character, and ensure an
-  // entry is created with the new (valid) name.
-  NO_FATALS(CheckTableDoesNotExist(kHmsDatabase, "a"));
-  ASSERT_OK(hms_catalog_->AlterTable(kTableId, "default.☃", "default.a", schema));
-  NO_FATALS(CheckTable(kHmsDatabase, "a", kTableId, schema));
-
-  // Alter a table without a database and ensure an entry is created with the new (valid) name.
-  NO_FATALS(CheckTableDoesNotExist(kHmsDatabase, "b"));
-  ASSERT_OK(hms_catalog_->AlterTable(kTableId, "no_database", "default.b", schema));
-  NO_FATALS(CheckTable(kHmsDatabase, "b", kTableId, schema));
-
-  // Drop a table containing a Hive incompatible character, and ensure it doesn't fail.
-  ASSERT_OK(hms_catalog_->DropTable(kTableId, "foo.☃"));
-
-  // Drop a table without a database, and ensure it doesn't fail.
-  ASSERT_OK(hms_catalog_->DropTable(kTableId, "no_database"));
 }
 
 // Checks that Kudu tables will not replace or modify existing HMS entries that
@@ -347,40 +346,56 @@ TEST_F(HmsCatalogTest, TestExternalTable) {
   NO_FATALS(CheckExternalTable());
   NO_FATALS(CheckTable("default", "a", kTableId, schema));
 
-  // Try and rename a Kudu table from the external table name to a new name.
-  // This depends on the Kudu table not actually existing in the HMS catalog.
-  ASSERT_OK(hms_catalog_->AlterTable(kTableId, "default.ext", "default.b", schema));
+  // Try and rename the external table. This shouldn't succeed because the Table
+  // ID doesn't match.
+  s = hms_catalog_->AlterTable(kTableId, "default.ext", "default.b", schema);
+  EXPECT_TRUE(s.IsNotFound()) << s.ToString();
   NO_FATALS(CheckExternalTable());
-  // The 'renamed' table is really just created with the new name.
-  NO_FATALS(CheckTable("default", "b", kTableId, schema));
+  NO_FATALS(CheckTable("default", "a", kTableId, schema));
+  NO_FATALS(CheckTableDoesNotExist("default", "b"));
 
-  // Try the previous alter operation again. This should succeed, since the
-  // destination table ID matches, so the HMS catalog knows its the same table.
-  // TODO(dan): once we have HMS catalog stats, assert that the op short circuits.
-  ASSERT_OK(hms_catalog_->AlterTable(kTableId, "default.ext", "default.b", schema));
-  NO_FATALS(CheckExternalTable());
-  // The 'renamed' table is really just created with the new name.
-  NO_FATALS(CheckTable("default", "b", kTableId, schema));
-
-  // Try the previous alter operation again, but with a different table ID.
-  s = hms_catalog_->AlterTable("new-table-id", "default.ext", "default.b", schema);
-  ASSERT_TRUE(s.IsAlreadyPresent()) << s.ToString();
-
-  // Try and alter a Kudu table with the same name as the external table.
-  // This depends on the Kudu table not actually existing in the HMS catalog.
-  s = hms_catalog_->AlterTable(kTableId, "default.ext", "default.ext", schema);
-  EXPECT_TRUE(s.IsAlreadyPresent()) << s.ToString();
-  NO_FATALS(CheckExternalTable());
-
-  // Try and drop the external table as if it were a Kudu table.  This should
-  // return an OK status, but not actually modify the external table.
-  ASSERT_OK(hms_catalog_->DropTable(kTableId, "default.ext"));
+  // Try and drop the external table as if it were a Kudu table.
+  s = hms_catalog_->DropTable(kTableId, "default.ext");
+  EXPECT_TRUE(s.IsRemoteError()) << s.ToString();
   NO_FATALS(CheckExternalTable());
 
   // Drop a Kudu table with no corresponding HMS entry.
   NO_FATALS(CheckTableDoesNotExist("default", "bogus_table_name"));
-  ASSERT_OK(hms_catalog_->DropTable(kTableId, "default.bogus_table_name"));
+  s = hms_catalog_->DropTable(kTableId, "default.bogus_table_name");
+  ASSERT_TRUE(s.IsNotFound()) << s.ToString();
   NO_FATALS(CheckTableDoesNotExist("default", "bogus_table_name"));
+}
+
+TEST_F(HmsCatalogTest, TestRetrieveTables) {
+  const string kHmsDatabase = "db";
+  const string kManagedTableName = "managed_table";
+  const string kExternalTableName = "external_table";
+  const string kNonKuduTableName = "non_kudu_table";
+
+  // Create a Impala managed table, a external table and a non Kudu table.
+  hive::Database db;
+  db.name = kHmsDatabase;
+  ASSERT_OK(hms_client_->CreateDatabase(db));
+  ASSERT_OK(CreateLegacyTable(kHmsDatabase,
+                              kManagedTableName,
+                              HmsClient::kManagedTable));
+  hive::Table table;
+  ASSERT_OK(hms_client_->GetTable(kHmsDatabase, kManagedTableName, &table));
+  ASSERT_OK(CreateLegacyTable(kHmsDatabase,
+                              kExternalTableName,
+                              HmsClient::kExternalTable));
+  ASSERT_OK(hms_client_->GetTable(kHmsDatabase, kExternalTableName, &table));
+
+  hive::Table non_kudu_table;
+  non_kudu_table.dbName = kHmsDatabase;
+  non_kudu_table.tableName = kNonKuduTableName;
+  ASSERT_OK(hms_client_->CreateTable(non_kudu_table));
+  ASSERT_OK(hms_client_->GetTable(kHmsDatabase, kNonKuduTableName, &table));
+
+  // Retrieve all tables and ensure all entries are found.
+  vector<hive::Table> hms_tables;
+  ASSERT_OK(hms_catalog_->RetrieveTables(&hms_tables));
+  ASSERT_EQ(3, hms_tables.size());
 }
 
 // Checks that the HmsCatalog handles reconnecting to the metastore after a connection failure.

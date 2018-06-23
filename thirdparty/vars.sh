@@ -119,7 +119,7 @@ GCOVR_VERSION=3.0
 GCOVR_NAME=gcovr-$GCOVR_VERSION
 GCOVR_SOURCE=$TP_SOURCE_DIR/$GCOVR_NAME
 
-CURL_VERSION=7.32.0
+CURL_VERSION=7.59.0
 CURL_NAME=curl-$CURL_VERSION
 CURL_SOURCE=$TP_SOURCE_DIR/$CURL_NAME
 
@@ -174,7 +174,7 @@ OPENSSL_WORKAROUND_DIR="$TP_DIR/installed/openssl-el6-workaround"
 
 # The breakpad source artifact is created using the script found in
 # scripts/make-breakpad-src-archive.sh
-BREAKPAD_VERSION=f78d953511606348173911ae0b62572ebec1bbc4
+BREAKPAD_VERSION=9eac2058b70615519b2c4d8c6bdbfca1bd079e39
 BREAKPAD_NAME=breakpad-$BREAKPAD_VERSION
 BREAKPAD_SOURCE=$TP_SOURCE_DIR/$BREAKPAD_NAME
 
@@ -208,11 +208,11 @@ BISON_VERSION=3.0.4
 BISON_NAME=bison-$BISON_VERSION
 BISON_SOURCE=$TP_SOURCE_DIR/$BISON_NAME
 
-# TODO(dan): bump to a release version once HIVE-17747 is published. The SHA
-# below is the current head of branch-2.
+# TODO(dan): bump to a release version once HIVE-17747 and HIVE-16886/HIVE-18526
+# are published. The SHA below is the current head of branch-2.
 # Note: The Hive release binary tarball is stripped of unnecessary jars before
 # being uploaded. See thirdparty/package-hive.sh for details.
-HIVE_VERSION=6189dbdea543939e977f97170f9a37389f46eb29
+HIVE_VERSION=c0a57a33b44d73fbe0f95256f0a3822bd3720aa8
 HIVE_NAME=apache-hive-$HIVE_VERSION-bin
 HIVE_SOURCE=$TP_SOURCE_DIR/$HIVE_NAME
 

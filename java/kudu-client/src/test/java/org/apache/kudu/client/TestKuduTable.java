@@ -576,6 +576,64 @@ public class TestKuduTable extends BaseKuduTest {
   }
 
   @Test(timeout = 100000)
+  public void testGetRangePartitions() throws Exception {
+    String tableName = name.getMethodName() + System.currentTimeMillis();
+
+    ArrayList<ColumnSchema> columns = new ArrayList<>();
+    columns.add(new ColumnSchema.ColumnSchemaBuilder("a", Type.STRING).key(true).build());
+    columns.add(new ColumnSchema.ColumnSchemaBuilder("b", Type.INT8).key(true).build());
+    Schema schema = new Schema(columns);
+
+    CreateTableOptions builder = new CreateTableOptions();
+    builder.addHashPartitions(ImmutableList.of("a"), 2);
+    builder.addHashPartitions(ImmutableList.of("b"), 2);
+    builder.setRangePartitionColumns(ImmutableList.of("a", "b"));
+
+    PartialRow bottom = schema.newPartialRow();
+    PartialRow middle = schema.newPartialRow();
+    middle.addString("a", "");
+    middle.addByte("b", (byte) -100);
+    PartialRow upper = schema.newPartialRow();
+
+    builder.addRangePartition(bottom, middle);
+    builder.addRangePartition(middle, upper);
+
+    KuduTable table = createTable(tableName, schema, builder);
+
+    List<Partition> rangePartitions =
+        table.getRangePartitions(client.getDefaultOperationTimeoutMs());
+    assertEquals(rangePartitions.size(), 2);
+
+    Partition lowerPartition = rangePartitions.get(0);
+    assertEquals(0, lowerPartition.getRangeKeyStart().length);
+    assertTrue(lowerPartition.getRangeKeyEnd().length > 0);
+    PartialRow decodedLower = lowerPartition.getDecodedRangeKeyEnd(table);
+    assertEquals("", decodedLower.getString("a"));
+    assertEquals((byte) -100, decodedLower.getByte("b"));
+
+    Partition upperPartition = rangePartitions.get(1);
+    assertTrue(upperPartition.getRangeKeyStart().length > 0);
+    assertEquals(0, upperPartition.getRangeKeyEnd().length);
+    PartialRow decodedUpper = upperPartition.getDecodedRangeKeyStart(table);
+    assertEquals("", decodedUpper.getString("a"));
+    assertEquals((byte) -100, decodedUpper.getByte("b"));
+  }
+
+  @Test(timeout = 100000)
+  public void testGetRangePartitionsUnbounded() throws Exception {
+    String tableName = name.getMethodName() + System.currentTimeMillis();
+    CreateTableOptions builder = getBasicCreateTableOptions();
+    KuduTable table = createTable(tableName, schema, builder);
+
+    List<Partition> rangePartitions =
+        table.getRangePartitions(client.getDefaultOperationTimeoutMs());
+    assertEquals(rangePartitions.size(), 1);
+    Partition partition = rangePartitions.get(0);
+    assertEquals(0, partition.getRangeKeyStart().length);
+    assertEquals(0, partition.getRangeKeyEnd().length);
+  }
+
+  @Test(timeout = 100000)
   public void testAlterNoWait() throws Exception {
     String tableName = name.getMethodName() + System.currentTimeMillis();
     createTable(tableName, basicSchema, getBasicCreateTableOptions());
@@ -618,5 +676,20 @@ public class TestKuduTable extends BaseKuduTest {
       return;
     }
     fail("Could not run test even after multiple attempts");
+  }
+
+  @Test(timeout = 100000)
+  public void testNumReplicas() throws Exception {
+    for (int i = 1; i <= 3; i++) {
+      // Ignore even numbers.
+      if (i % 2 != 0) {
+        String tableName = name.getMethodName() + System.currentTimeMillis() + "-" + i;
+        CreateTableOptions options = getBasicCreateTableOptions();
+        options.setNumReplicas(i);
+        createTable(tableName, basicSchema, options);
+        KuduTable table = syncClient.openTable(tableName);
+        assertEquals(i, table.getNumReplicas());
+      }
+    }
   }
 }
