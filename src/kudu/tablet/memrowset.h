@@ -28,7 +28,6 @@
 #include <boost/optional/optional.hpp>
 #include <glog/logging.h>
 
-#include "kudu/common/common.pb.h"
 #include "kudu/common/iterator.h"
 #include "kudu/common/row.h"
 #include "kudu/common/rowid.h"
@@ -39,7 +38,6 @@
 #include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/macros.h"
 #include "kudu/tablet/concurrent_btree.h"
-#include "kudu/tablet/mvcc.h"
 #include "kudu/tablet/rowset.h"
 #include "kudu/tablet/rowset_metadata.h"
 #include "kudu/util/faststring.h"
@@ -58,9 +56,13 @@ class RowChangeList;
 class ScanSpec;
 struct IteratorStats;
 
+namespace tablet {
+class MvccSnapshot;
+} // namespace tablet
+
 namespace consensus {
 class OpId;
-}
+} // namespace consensus
 
 namespace tablet {
 //
@@ -309,13 +311,10 @@ class MemRowSet : public RowSet,
   //
   // TODO(todd): clarify the consistency of this iterator in the method doc
   Iterator *NewIterator() const;
-  Iterator *NewIterator(const Schema *projection,
-                        const MvccSnapshot &snap) const;
+  Iterator *NewIterator(const RowIteratorOptions& opts) const;
 
   // Alias to conform to DiskRowSet interface
-  virtual Status NewRowIterator(const Schema* projection,
-                                const MvccSnapshot& snap,
-                                OrderMode order,
+  virtual Status NewRowIterator(const RowIteratorOptions& opts,
                                 gscoped_ptr<RowwiseIterator>* out) const override;
 
   // Create compaction input.
@@ -515,7 +514,7 @@ class MemRowSet::Iterator : public RowwiseIterator {
   }
 
   const Schema& schema() const override {
-    return *projection_;
+    return *opts_.projection;
   }
 
   virtual void GetIteratorStats(std::vector<IteratorStats>* stats) const override {
@@ -541,29 +540,52 @@ class MemRowSet::Iterator : public RowwiseIterator {
   DISALLOW_COPY_AND_ASSIGN(Iterator);
 
   Iterator(const std::shared_ptr<const MemRowSet> &mrs,
-           MemRowSet::MSBTIter *iter, const Schema *projection,
-           MvccSnapshot mvcc_snap);
+           MemRowSet::MSBTIter *iter, RowIteratorOptions opts);
 
-  // Various helper functions called while getting the next RowBlock
+  // Retrieves a block of dst->nrows() rows from the MemRowSet.
+  //
+  // Writes the number of rows retrieved to 'fetched'.
   Status FetchRows(RowBlock* dst, size_t* fetched);
-  Status ApplyMutationsToProjectedRow(const Mutation *mutation_head,
-                                      RowBlockRow *dst_row,
-                                      Arena *dst_arena);
+
+  // Walks the mutations in 'mutation_head', applying relevant ones to 'dst_row'
+  // (performing any allocations out of 'dst_arena').
+  //
+  // On success, 'apply_status' summarizes the application process.
+  enum ApplyStatus {
+    // No mutations were applied to the row, either because none existed or
+    // because none were relevant.
+    NONE_APPLIED,
+
+    // At least one mutation was applied to the row.
+    APPLIED_AND_PRESENT,
+
+    // At least one mutation was applied to the row, and the row's final state
+    // was deleted (i.e. the last mutation was a DELETE).
+    APPLIED_AND_DELETED,
+  };
+  Status ApplyMutationsToProjectedRow(const Mutation* mutation_head,
+                                      RowBlockRow* dst_row,
+                                      Arena* dst_arena,
+                                      ApplyStatus* apply_status);
 
   const std::shared_ptr<const MemRowSet> memrowset_;
   gscoped_ptr<MemRowSet::MSBTIter> iter_;
 
-  // The MVCC snapshot which determines which rows and mutations are visible to
-  // this iterator.
-  const MvccSnapshot mvcc_snap_;
+  const RowIteratorOptions opts_;
 
   // Mapping from projected column index back to memrowset column index.
   // Relies on the MRSRowProjector interface to abstract from the two
   // different implementations of the RowProjector, which may change
   // at runtime (using vs. not using code generation).
-  const Schema* const projection_;
-  gscoped_ptr<MRSRowProjector> projector_;
+  const gscoped_ptr<MRSRowProjector> projector_;
   DeltaProjector delta_projector_;
+
+  // The index of the first IS_DELETED virtual column in the projection schema,
+  // or kColumnNotFound if one doesn't exist.
+  //
+  // The virtual column must not be nullable and must have a read default value.
+  // The process will crash if these constraints are not met.
+  int projection_vc_is_deleted_idx_;
 
   // Temporary buffer used for RowChangeList projection.
   faststring delta_buf_;

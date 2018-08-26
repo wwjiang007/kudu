@@ -55,8 +55,15 @@ unzip_to_source() {
 fetch_and_expand() {
   local FILENAME=$1
   local SOURCE=$2
+  local URL_PREFIX=$3
+
   if [ -z "$FILENAME" ]; then
     echo "Error: Must specify file to fetch"
+    exit 1
+  fi
+
+  if [ -z "$URL_PREFIX" ]; then
+    echo "Error: Must specify url prefix to fetch"
     exit 1
   fi
 
@@ -65,15 +72,23 @@ fetch_and_expand() {
     TAR_CMD=gtar
   fi
 
-  FULL_URL="${CLOUDFRONT_URL_PREFIX}/${FILENAME}"
+  FULL_URL="${URL_PREFIX}/${FILENAME}"
+
   SUCCESS=0
-  # Loop in case we encounter a corrupted archive and we need to re-download it.
-  for attempt in 1 2; do
+  # Loop in case we encounter an error.
+  for attempt in 1 2 3; do
     if [ -r "$FILENAME" ]; then
       echo "Archive $FILENAME already exists. Not re-downloading archive."
     else
       echo "Fetching $FILENAME from $FULL_URL"
-      curl --retry 3 -L -O "$FULL_URL"
+      if ! curl --retry 3 -L -O "$FULL_URL"; then
+        echo "Error downloading $FILENAME"
+        rm -f "$FILENAME"
+
+        # Pause for a bit before looping in case the server throttled us.
+        sleep 5
+        continue
+      fi
     fi
 
     echo "Unpacking $FILENAME to $SOURCE"
@@ -112,25 +127,41 @@ fetch_and_expand() {
   echo
 }
 
-fetch_and_patch() {
-    local FILENAME=$1
-    local SOURCE=$2
-    local PATCH_LEVEL=$3
-    # Remaining args are expected to be a list of patch commands
+fetch_with_url_and_patch() {
+  local FILENAME=$1
+  local SOURCE=$2
+  local PATCH_LEVEL=$3
+  local URL_PREFIX=$4
+  # Remaining args are expected to be a list of patch commands
 
-    delete_if_wrong_patchlevel $SOURCE $PATCH_LEVEL
-    if [ ! -d $SOURCE ]; then
-        fetch_and_expand $FILENAME $SOURCE
-        pushd $SOURCE
-        shift 3
-        # Run the patch commands
-        for f in "$@"; do
-            eval "$f"
-        done
-        touch patchlevel-$PATCH_LEVEL
-        popd
-        echo
-    fi
+  delete_if_wrong_patchlevel $SOURCE $PATCH_LEVEL
+  if [ ! -d $SOURCE ]; then
+    fetch_and_expand $FILENAME $SOURCE $URL_PREFIX
+    pushd $SOURCE
+    shift 4
+    # Run the patch commands
+    for f in "$@"; do
+      eval "$f"
+    done
+    touch patchlevel-$PATCH_LEVEL
+    popd
+    echo
+  fi
+}
+
+# Call fetch_with_url_and_patch with the default dependency URL source.
+fetch_and_patch() {
+  local FILENAME=$1
+  local SOURCE=$2
+  local PATCH_LEVEL=$3
+
+  shift 3
+  fetch_with_url_and_patch \
+    $FILENAME \
+    $SOURCE \
+    $PATCH_LEVEL \
+    $DEPENDENCY_URL \
+    "$@"
 }
 
 mkdir -p $TP_SOURCE_DIR

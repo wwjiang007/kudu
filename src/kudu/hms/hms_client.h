@@ -23,17 +23,10 @@
 
 #include "kudu/gutil/port.h"
 #include "kudu/hms/ThriftHiveMetastore.h"
+#include "kudu/hms/hive_metastore_types.h"
 #include "kudu/util/monotime.h"
 #include "kudu/util/slice.h"
 #include "kudu/util/status.h"
-
-namespace hive {
-class Database;
-class EnvironmentContext;
-class NotificationEvent;
-class Partition;
-class Table;
-}
 
 namespace kudu {
 
@@ -96,6 +89,7 @@ class HmsClient {
   static const char* const kKuduMasterEventKey;;
   static const char* const kStorageHandlerKey;
   static const char* const kKuduStorageHandler;
+  static const char* const kHiveFilterFieldParams;
 
   static const char* const kTransactionalEventListeners;
   static const char* const kDisallowIncompatibleColTypeChanges;
@@ -175,9 +169,21 @@ class HmsClient {
                   const std::string& table_name,
                   hive::Table* table) WARN_UNUSED_RESULT;
 
-  // Retrieves all tables in an HMS database.
-  Status GetAllTables(const std::string& database_name,
-                      std::vector<std::string>* tables) WARN_UNUSED_RESULT;
+  // Retrieves HMS table metadata for all tables in 'table_names'.
+  Status GetTables(const std::string& database_name,
+                   const std::vector<std::string>& table_names,
+                   std::vector<hive::Table>* tables) WARN_UNUSED_RESULT;
+
+  // Retrieves all table names in an HMS database.
+  Status GetTableNames(const std::string& database_name,
+                       std::vector<std::string>* table_names) WARN_UNUSED_RESULT;
+
+  // Retrieves all table names in an HMS database matching a filter. See the
+  // docs for 'get_table_names_by_filter' in hive_metastore.thrift for filter
+  // syntax examples.
+  Status GetTableNames(const std::string& database_name,
+                       const std::string& filter,
+                       std::vector<std::string>* table_names) WARN_UNUSED_RESULT;
 
   // Retrieves a the current HMS notification event ID.
   Status GetCurrentNotificationEventId(int64_t* event_id) WARN_UNUSED_RESULT;

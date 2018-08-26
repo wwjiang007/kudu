@@ -16,6 +16,11 @@
 // under the License.
 package org.apache.kudu.client;
 
+import static org.apache.kudu.util.ClientTestUtil.countRowsInScan;
+import static org.apache.kudu.util.ClientTestUtil.createBasicSchemaInsert;
+import static org.apache.kudu.util.ClientTestUtil.defaultErrorCB;
+import static org.apache.kudu.util.ClientTestUtil.getBasicCreateTableOptions;
+import static org.apache.kudu.util.ClientTestUtil.getBasicSchema;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
@@ -28,7 +33,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 import com.stumbleupon.async.Callback;
 import com.stumbleupon.async.Deferred;
-import org.junit.BeforeClass;
+import org.junit.Before;
 import org.junit.Test;
 
 import org.apache.kudu.Schema;
@@ -54,12 +59,10 @@ public class TestAsyncKuduSession extends BaseKuduTest {
   private static Schema schema = getBasicSchema();
   private static KuduTable table;
 
-  @BeforeClass
-  public static void setUpBeforeClass() throws Exception {
-    BaseKuduTest.setUpBeforeClass();
+  @Before
+  public void setUp() throws Exception {
     table = createTable(TABLE_NAME, schema, getBasicCreateTableOptions());
   }
-
 
   @Test(timeout = 100000)
   public void testBackgroundErrors() throws Exception {
@@ -478,7 +481,7 @@ public class TestAsyncKuduSession extends BaseKuduTest {
     return delete;
   }
 
-  public static boolean exists(final int key) throws Exception {
+  public boolean exists(final int key) throws Exception {
 
     AsyncKuduScanner scanner = getScanner(key, key + 1);
     final AtomicBoolean exists = new AtomicBoolean(false);
@@ -512,7 +515,7 @@ public class TestAsyncKuduSession extends BaseKuduTest {
     return exists.get();
   }
 
-  public static int countNullColumns(final int startKey, final int endKey) throws Exception {
+  public int countNullColumns(final int startKey, final int endKey) throws Exception {
 
     AsyncKuduScanner scanner = getScanner(startKey, endKey);
     final AtomicInteger ai = new AtomicInteger();
@@ -541,17 +544,17 @@ public class TestAsyncKuduSession extends BaseKuduTest {
     return ai.get();
   }
 
-  public static int countInRange(final int start, final int exclusiveEnd) throws Exception {
+  public int countInRange(final int start, final int exclusiveEnd) throws Exception {
 
     AsyncKuduScanner scanner = getScanner(start, exclusiveEnd);
     return countRowsInScan(scanner);
   }
 
-  private static AsyncKuduScanner getScanner(int start, int exclusiveEnd) {
+  private AsyncKuduScanner getScanner(int start, int exclusiveEnd) {
     return getScanner(start, exclusiveEnd, null);
   }
 
-  private static AsyncKuduScanner getScanner(int start, int exclusiveEnd,
+  private AsyncKuduScanner getScanner(int start, int exclusiveEnd,
                                              List<String> columnNames) {
 
     PartialRow lowerBound = schema.newPartialRow();

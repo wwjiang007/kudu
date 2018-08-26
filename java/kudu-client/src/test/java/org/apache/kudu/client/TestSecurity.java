@@ -14,6 +14,8 @@
 package org.apache.kudu.client;
 
 import static org.apache.kudu.util.AssertHelpers.assertEventuallyTrue;
+import static org.apache.kudu.util.ClientTestUtil.createBasicSchemaInsert;
+import static org.apache.kudu.util.ClientTestUtil.getBasicCreateTableOptions;
 import static org.junit.Assert.assertNotNull;
 
 import java.io.Closeable;
@@ -28,6 +30,7 @@ import javax.security.auth.Subject;
 
 import org.apache.kudu.client.Client.AuthenticationCredentialsPB;
 import org.apache.kudu.client.MiniKuduCluster.MiniKuduClusterBuilder;
+import org.apache.kudu.junit.RetryRule;
 import org.apache.kudu.master.Master.ConnectToMasterResponsePB;
 import org.apache.kudu.util.AssertHelpers;
 import org.apache.kudu.util.AssertHelpers.BooleanExpression;
@@ -36,7 +39,9 @@ import org.apache.kudu.util.SecurityUtil;
 import org.hamcrest.CoreMatchers;
 import org.junit.After;
 import org.junit.Assert;
+import org.junit.Before;
 import org.junit.BeforeClass;
+import org.junit.Rule;
 import org.junit.Test;
 
 import com.google.common.base.Preconditions;
@@ -60,7 +65,6 @@ public class TestSecurity {
   };
 
   private void startCluster(Set<Option> opts) throws IOException {
-    Preconditions.checkState(miniCluster == null);
     MiniKuduClusterBuilder mcb = new MiniKuduClusterBuilder();
     mcb.enableKerberos();
     if (opts.contains(Option.LONG_LEADER_ELECTION)) {
@@ -84,13 +88,18 @@ public class TestSecurity {
     client.listTabletServers();
   }
 
-  @BeforeClass
-  public static void setUpBeforeClass() throws Exception {
+  // Add a rule to rerun tests. We use this with Gradle because it doesn't support
+  // Surefire/Failsafe rerunFailingTestsCount like Maven does.
+  @Rule
+  public RetryRule retryRule = new RetryRule();
+
+  @Before
+  public void setUp() {
     FakeDNS.getInstance().install();
   }
 
   @After
-  public void reset() throws IOException, InterruptedException {
+  public void tearDown() throws IOException {
     if (client != null) {
       client.close();
     }
@@ -161,9 +170,9 @@ public class TestSecurity {
       // we should now be able to perform all of the normal client operations.
       newClient.importAuthenticationCredentials(authnData);
       KuduTable table = newClient.createTable(TABLE_NAME, BaseKuduTest.basicSchema,
-          BaseKuduTest.getBasicCreateTableOptions());
+          getBasicCreateTableOptions());
       KuduSession session = newClient.newSession();
-      session.apply(BaseKuduTest.createBasicSchemaInsert(table, 1));
+      session.apply(createBasicSchemaInsert(table, 1));
       session.flush();
     } finally {
       // Restore ticket cache for other test cases.

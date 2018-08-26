@@ -315,7 +315,18 @@ class TableLoader : public TableVisitor {
     bool is_deleted = l.mutable_data()->is_deleted();
     catalog_manager_->table_ids_map_[table->id()] = table;
     if (!is_deleted) {
-      catalog_manager_->table_names_map_[l.data().name()] = table;
+      auto* existing = InsertOrReturnExisting(&catalog_manager_->normalized_table_names_map_,
+                                              CatalogManager::NormalizeTableName(l.data().name()),
+                                              table);
+      if (existing) {
+        // Return an HMS-specific error message, since this error currently only
+        // occurs when the HMS is enabled.
+        return Status::IllegalState(
+            "when the Hive Metastore integration is enabled, Kudu table names must not differ "
+            "only by case; restart the master(s) with the Hive Metastore integration disabled and "
+            "rename one of the conflicting tables",
+            Substitute("$0 or $1 [id=$2]", (*existing)->ToString(), l.data().name(), table_id));
+      }
     }
     l.Commit();
 
@@ -1126,7 +1137,7 @@ Status CatalogManager::VisitTablesAndTabletsUnlocked() {
   AbortAndWaitForAllTasks(tables);
 
   // Clear the existing state.
-  table_names_map_.clear();
+  normalized_table_names_map_.clear();
   table_ids_map_.clear();
   tablet_map_.clear();
 
@@ -1304,13 +1315,20 @@ Status ValidateClientSchema(const optional<string>& name,
     }
   }
 
-  // Check that the encodings are valid for the specified types.
   for (int i = 0; i < schema.num_columns(); i++) {
     const auto& col = schema.column(i);
+    const auto* ti = col.type_info();
+
+    // Prohibit the creation of virtual columns.
+    if (ti->is_virtual()) {
+      return Status::InvalidArgument(Substitute(
+          "may not create virtual column of type '$0' (column '$1')",
+          ti->name(), col.name()));
+    }
+
+    // Check that the encodings are valid for the specified types.
     const TypeEncodingInfo *dummy;
-    Status s = TypeEncodingInfo::Get(col.type_info(),
-                                     col.attributes().encoding,
-                                     &dummy);
+    Status s = TypeEncodingInfo::Get(ti, col.attributes().encoding, &dummy);
     if (!s.ok()) {
       return s.CloneAndPrepend(Substitute("invalid encoding for column '$0'", col.name()));
     }
@@ -1352,9 +1370,9 @@ Status CatalogManager::CreateTable(const CreateTableRequestPB* orig_req,
   // a. Validate the user request.
   Schema client_schema;
   RETURN_NOT_OK(SchemaFromPB(req.schema(), &client_schema));
-  const string& table_name = req.name();
+  const string normalized_table_name = NormalizeTableName(req.name());
 
-  RETURN_NOT_OK(SetupError(ValidateClientSchema(table_name, client_schema),
+  RETURN_NOT_OK(SetupError(ValidateClientSchema(normalized_table_name, client_schema),
                            resp, MasterErrorPB::INVALID_SCHEMA));
   if (client_schema.has_column_ids()) {
     return SetupError(Status::InvalidArgument("user requests should not have Column IDs"),
@@ -1449,8 +1467,8 @@ Status CatalogManager::CreateTable(const CreateTableRequestPB* orig_req,
   // of live tablet servers.
   TSDescriptorVector ts_descs;
   master_->ts_manager()->GetAllLiveDescriptors(&ts_descs);
-  int num_live_tservers = ts_descs.size();
-  int max_tablets = FLAGS_max_create_tablets_per_ts * num_live_tservers;
+  const auto num_live_tservers = ts_descs.size();
+  const auto max_tablets = FLAGS_max_create_tablets_per_ts * num_live_tservers;
   if (num_replicas > 1 && max_tablets > 0 && partitions.size() > max_tablets) {
     return SetupError(Status::InvalidArgument(Substitute(
             "the requested number of tablets is over the maximum permitted at creation time ($0), "
@@ -1474,18 +1492,13 @@ Status CatalogManager::CreateTable(const CreateTableRequestPB* orig_req,
   const auto num_ts_needed_for_rereplication =
       num_replicas + (FLAGS_raft_prepare_replacement_before_eviction ? 1 : 0);
   if (num_replicas > 1 && num_ts_needed_for_rereplication > num_live_tservers) {
-    const bool is_off_by_one = FLAGS_raft_prepare_replacement_before_eviction &&
-        num_ts_needed_for_rereplication == num_live_tservers + 1;
-    const string msg = Substitute(
+    LOG(WARNING) << Substitute(
         "The number of live tablet servers is not enough to re-replicate a "
-        "tablet replica of the newly created table $0 in case of a replica "
-        "failure: $1 tablet servers are needed, $2 are alive. "
-        "Consider bringing up additional tablet server(s)$3",
-        table_name, num_ts_needed_for_rereplication, num_live_tservers,
-        is_off_by_one ? " or running both the masters and all tablet servers"
-                        " with --raft_prepare_replacement_before_eviction=false"
-                        " flag (not recommended)." : ".");
-    LOG(WARNING) << msg;
+        "tablet replica of the newly created table $0 in case of a server "
+        "failure: $1 tablet servers would be needed, $2 are available. "
+        "Consider bringing up more tablet servers.",
+        normalized_table_name, num_ts_needed_for_rereplication,
+        num_live_tservers);
   }
 
   scoped_refptr<TableInfo> table;
@@ -1494,22 +1507,22 @@ Status CatalogManager::CreateTable(const CreateTableRequestPB* orig_req,
     TRACE("Acquired catalog manager lock");
 
     // b. Verify that the table does not exist.
-    table = FindPtrOrNull(table_names_map_, table_name);
+    table = FindPtrOrNull(normalized_table_names_map_, normalized_table_name);
     if (table != nullptr) {
       return SetupError(Status::AlreadyPresent(Substitute(
-              "table $0 already exists with id $1", table_name, table->id())),
+              "table $0 already exists with id $1", normalized_table_name, table->id())),
           resp, MasterErrorPB::TABLE_ALREADY_PRESENT);
     }
 
     // c. Reserve the table name if possible.
-    if (!InsertIfNotPresent(&reserved_table_names_, table_name)) {
+    if (!InsertIfNotPresent(&reserved_normalized_table_names_, normalized_table_name)) {
       // ServiceUnavailable will cause the client to retry the create table
       // request. We don't want to outright fail the request with
       // 'AlreadyPresent', because a table name reservation can be rolled back
       // in the case of an error. Instead, we force the client to retry at a
       // later time.
       return SetupError(Status::ServiceUnavailable(Substitute(
-              "new table name $0 is already reserved", table_name)),
+              "new table name $0 is already reserved", normalized_table_name)),
           resp, MasterErrorPB::TABLE_ALREADY_PRESENT);
     }
   }
@@ -1517,7 +1530,7 @@ Status CatalogManager::CreateTable(const CreateTableRequestPB* orig_req,
   // Ensure that we drop the name reservation upon return.
   SCOPED_CLEANUP({
     std::lock_guard<LockType> l(lock_);
-    CHECK_EQ(1, reserved_table_names_.erase(table_name));
+    CHECK_EQ(1, reserved_normalized_table_names_.erase(normalized_table_name));
   });
 
   // d. Create the in-memory representation of the new table and its tablets.
@@ -1552,10 +1565,10 @@ Status CatalogManager::CreateTable(const CreateTableRequestPB* orig_req,
   // It is critical that this step happen before writing the table to the sys catalog,
   // since this step validates that the table name is available in the HMS catalog.
   if (hms_catalog_) {
-    Status s = hms_catalog_->CreateTable(table->id(), req.name(), schema);
+    Status s = hms_catalog_->CreateTable(table->id(), normalized_table_name, schema);
     if (!s.ok()) {
       s = s.CloneAndPrepend(Substitute("an error occurred while creating table $0 in the HMS",
-                                       req.name()));
+                                       normalized_table_name));
       LOG(WARNING) << s.ToString();
       return SetupError(std::move(s), resp, MasterErrorPB::HIVE_METASTORE_ERROR);
     }
@@ -1565,7 +1578,7 @@ Status CatalogManager::CreateTable(const CreateTableRequestPB* orig_req,
       // TODO(dan): figure out how to test this.
       if (hms_catalog_) {
         TRACE("Rolling back HMS table creation");
-        WARN_NOT_OK(hms_catalog_->DropTable(table->id(), req.name()),
+        WARN_NOT_OK(hms_catalog_->DropTable(table->id(), normalized_table_name),
                     "an error occurred while attempting to delete orphaned HMS table entry");
       }
   });
@@ -1610,7 +1623,7 @@ Status CatalogManager::CreateTable(const CreateTableRequestPB* orig_req,
     std::lock_guard<LockType> l(lock_);
 
     table_ids_map_[table->id()] = table;
-    table_names_map_[table_name] = table;
+    normalized_table_names_map_[normalized_table_name] = table;
     for (const auto& tablet : tablets) {
       InsertOrDie(&tablet_map_, tablet->id(), tablet);
     }
@@ -1649,7 +1662,7 @@ scoped_refptr<TableInfo> CatalogManager::CreateTableInfo(const CreateTableReques
   table->mutable_metadata()->StartMutation();
   SysTablesEntryPB *metadata = &table->mutable_metadata()->mutable_dirty()->pb;
   metadata->set_state(SysTablesEntryPB::PREPARING);
-  metadata->set_name(req.name());
+  metadata->set_name(NormalizeTableName(req.name()));
   metadata->set_version(0);
   metadata->set_next_column_id(ColumnId(schema.max_col_id() + 1));
   metadata->set_num_replicas(req.num_replicas());
@@ -1695,11 +1708,13 @@ Status CatalogManager::FindAndLockTable(const ReqClass& request,
       // If the request contains both a table ID and table name, ensure that
       // both match the same table.
       if (table_identifier.has_table_name() &&
-          table.get() != FindPtrOrNull(table_names_map_, table_identifier.table_name()).get()) {
+          table.get() != FindPtrOrNull(normalized_table_names_map_,
+                                       NormalizeTableName(table_identifier.table_name())).get()) {
         return tnf_error();
       }
     } else if (table_identifier.has_table_name()) {
-      table = FindPtrOrNull(table_names_map_, table_identifier.table_name());
+      table = FindPtrOrNull(normalized_table_names_map_,
+                            NormalizeTableName(table_identifier.table_name()));
     } else {
       return SetupError(Status::InvalidArgument("missing table ID or table name"),
                         response, MasterErrorPB::UNKNOWN_ERROR);
@@ -1714,7 +1729,8 @@ Status CatalogManager::FindAndLockTable(const ReqClass& request,
   // Acquire the table lock.
   TableMetadataLock lock(table.get(), lock_mode);
 
-  if (table_identifier.has_table_name() && table_identifier.table_name() != lock.data().name()) {
+  if (table_identifier.has_table_name() &&
+      NormalizeTableName(table_identifier.table_name()) != NormalizeTableName(lock.data().name())) {
     // We've encountered the table while it's in the process of being renamed;
     // pretend it doesn't yet exist.
     return tnf_error();
@@ -1843,7 +1859,7 @@ Status CatalogManager::DeleteTable(const DeleteTableRequestPB& req,
     {
       TRACE("Removing table from by-name map");
       std::lock_guard<LockType> l_map(lock_);
-      if (table_names_map_.erase(l.data().name()) != 1) {
+      if (normalized_table_names_map_.erase(NormalizeTableName(l.data().name())) != 1) {
         LOG(FATAL) << "Could not remove table " << table->ToString()
                    << " from map in response to DeleteTable request: "
                    << SecureShortDebugString(req);
@@ -2143,18 +2159,30 @@ Status CatalogManager::AlterTableRpc(const AlterTableRequestPB& req,
   // that event to the catalog. By 'serializing' the rename through the
   // HMS, race conditions are avoided.
   if (hms_catalog_ && req.has_new_table_name() && req.alter_external_catalogs()) {
-    // Look up the table, lock it, and mark it as removed.
+    // Look up the table and lock it.
     scoped_refptr<TableInfo> table;
     TableMetadataLock l;
     RETURN_NOT_OK(FindAndLockTable(req, resp, LockMode::READ, &table, &l));
     RETURN_NOT_OK(CheckIfTableDeletedOrNotRunning(&l, resp));
+    string normalized_new_table_name = NormalizeTableName(req.new_table_name());
+
+    // The HMS allows renaming a table to the same name (ALTER TABLE t RENAME TO t),
+    // however Kudu does not, so we must enforce this constraint ourselves before
+    // altering the table in the HMS. The comparison is on the non-normalized
+    // table names, since we want to allow changing the case of a table name.
+    if (l.data().name() == normalized_new_table_name) {
+      return SetupError(
+          Status::AlreadyPresent(Substitute("table $0 already exists with id $1",
+              normalized_new_table_name, table->id())),
+          resp, MasterErrorPB::TABLE_ALREADY_PRESENT);
+    }
 
     Schema schema;
     RETURN_NOT_OK(SchemaFromPB(l.data().pb.schema(), &schema));
 
     // Rename the table in the HMS.
     RETURN_NOT_OK(SetupError(hms_catalog_->AlterTable(
-            table->id(), l.data().name(), req.new_table_name(),
+            table->id(), l.data().name(), normalized_new_table_name,
             schema),
         resp, MasterErrorPB::HIVE_METASTORE_ERROR));
 
@@ -2235,7 +2263,7 @@ Status CatalogManager::AlterTable(const AlterTableRequestPB& req,
         resp, MasterErrorPB::TABLE_NOT_FOUND);
   }
 
-  string table_name = l.data().name();
+  string normalized_table_name = NormalizeTableName(l.data().name());
   *resp->mutable_table_id() = table->id();
 
   // 3. Calculate and validate new schema for the on-disk state, not persisted yet.
@@ -2260,7 +2288,10 @@ Status CatalogManager::AlterTable(const AlterTableRequestPB& req,
         resp, MasterErrorPB::INVALID_SCHEMA));
 
   // 4. Validate and try to acquire the new table name.
+  string normalized_new_table_name = NormalizeTableName(req.new_table_name());
   if (req.has_new_table_name()) {
+
+    // Validate the new table name.
     RETURN_NOT_OK(SetupError(
           ValidateIdentifier(req.new_table_name()).CloneAndPrepend("invalid table name"),
           resp, MasterErrorPB::INVALID_SCHEMA));
@@ -2268,35 +2299,41 @@ Status CatalogManager::AlterTable(const AlterTableRequestPB& req,
     std::lock_guard<LockType> catalog_lock(lock_);
     TRACE("Acquired catalog manager lock");
 
-    // Verify that the table does not exist.
-    scoped_refptr<TableInfo> other_table = FindPtrOrNull(table_names_map_, req.new_table_name());
-    if (other_table != nullptr) {
+    // Verify that a table does not already exist with the new name. This
+    // also disallows no-op renames (ALTER TABLE a RENAME TO a).
+    //
+    // Special case: if this is a rename of a table from a non-normalized to
+    // normalized name (ALTER TABLE A RENAME to a), then allow it.
+    scoped_refptr<TableInfo> other_table = FindPtrOrNull(normalized_table_names_map_,
+                                                         normalized_new_table_name);
+    if (other_table &&
+        !(table.get() == other_table.get() && l.data().name() != normalized_new_table_name)) {
       return SetupError(
           Status::AlreadyPresent(Substitute("table $0 already exists with id $1",
-              req.new_table_name(), table->id())),
+              normalized_new_table_name, other_table->id())),
           resp, MasterErrorPB::TABLE_ALREADY_PRESENT);
     }
 
     // Reserve the new table name if possible.
-    if (!InsertIfNotPresent(&reserved_table_names_, req.new_table_name())) {
+    if (!InsertIfNotPresent(&reserved_normalized_table_names_, normalized_new_table_name)) {
       // ServiceUnavailable will cause the client to retry the create table
       // request. We don't want to outright fail the request with
       // 'AlreadyPresent', because a table name reservation can be rolled back
       // in the case of an error. Instead, we force the client to retry at a
       // later time.
       return SetupError(Status::ServiceUnavailable(Substitute(
-              "table name $0 is already reserved", req.new_table_name())),
+              "table name $0 is already reserved", normalized_new_table_name)),
           resp, MasterErrorPB::TABLE_ALREADY_PRESENT);
     }
 
-    l.mutable_data()->pb.set_name(req.new_table_name());
+    l.mutable_data()->pb.set_name(normalized_new_table_name);
   }
 
   // Ensure that we drop our reservation upon return.
-  auto cleanup = MakeScopedCleanup([&] () {
+  SCOPED_CLEANUP({
     if (req.has_new_table_name()) {
       std::lock_guard<LockType> l(lock_);
-      CHECK_EQ(1, reserved_table_names_.erase(req.new_table_name()));
+      CHECK_EQ(1, reserved_normalized_table_names_.erase(normalized_new_table_name));
     }
   });
 
@@ -2393,12 +2430,12 @@ Status CatalogManager::AlterTable(const AlterTableRequestPB& req,
     // and tablets indices.
     std::lock_guard<LockType> lock(lock_);
     if (req.has_new_table_name()) {
-      if (table_names_map_.erase(table_name) != 1) {
+      if (normalized_table_names_map_.erase(normalized_table_name) != 1) {
         LOG(FATAL) << "Could not remove table " << table->ToString()
                    << " from map in response to AlterTable request: "
                    << SecureShortDebugString(req);
       }
-      InsertOrDie(&table_names_map_, req.new_table_name(), table);
+      InsertOrDie(&normalized_table_names_map_, normalized_new_table_name, table);
     }
 
     // Insert new tablets into the global tablet map. After this, the tablets
@@ -2443,10 +2480,10 @@ Status CatalogManager::AlterTable(const AlterTableRequestPB& req,
     // table rename, since we split out the rename portion into its own
     // 'transaction' which is serialized through the HMS.
     DCHECK(!req.has_new_table_name());
-    WARN_NOT_OK(hms_catalog_->AlterTable(table->id(), table_name, table_name, new_schema),
-                Substitute(
-                  "failed to alter HiveMetastore schema for table $0, "
-                  "HMS schema information will be stale", table->ToString()));
+    WARN_NOT_OK(hms_catalog_->AlterTable(
+          table->id(), normalized_table_name, normalized_table_name, new_schema),
+        Substitute("failed to alter HiveMetastore schema for table $0, "
+                   "HMS schema information will be stale", table->ToString()));
   }
 
   if (!tablets_to_add.empty() || has_metadata_changes) {
@@ -2520,7 +2557,7 @@ Status CatalogManager::ListTables(const ListTablesRequestPB* req,
 
   shared_lock<LockType> l(lock_);
 
-  for (const TableInfoMap::value_type& entry : table_names_map_) {
+  for (const TableInfoMap::value_type& entry : normalized_table_names_map_) {
     TableMetadataLock ltm(entry.second.get(), LockMode::READ);
     if (!ltm.data().is_running()) continue; // implies !is_deleted() too
 
@@ -2531,7 +2568,7 @@ Status CatalogManager::ListTables(const ListTablesRequestPB* req,
       }
     }
 
-    ListTablesResponsePB::TableInfo *table = resp->add_tables();
+    ListTablesResponsePB::TableInfo* table = resp->add_tables();
     table->set_id(entry.second->id());
     table->set_name(ltm.data().name());
   }
@@ -2564,7 +2601,7 @@ Status CatalogManager::TableNameExists(const string& table_name, bool* exists) {
   RETURN_NOT_OK(CheckOnline());
 
   shared_lock<LockType> l(lock_);
-  *exists = ContainsKey(table_names_map_, table_name);
+  *exists = ContainsKey(normalized_table_names_map_, NormalizeTableName(table_name));
   return Status::OK();
 }
 
@@ -4662,7 +4699,7 @@ void CatalogManager::DumpState(std::ostream* out) const {
   {
     shared_lock<LockType> l(lock_);
     ids_copy = table_ids_map_;
-    names_copy = table_names_map_;
+    names_copy = normalized_table_names_map_;
     tablets_copy = tablet_map_;
     // TODO(aserbin): add information about root CA certs, if any
   }
@@ -4745,6 +4782,28 @@ Status CatalogManager::WaitForNotificationLogListenerCatchUp(RespClass* resp,
     return SetupError(s, resp, code);
   }
   return Status::OK();
+}
+
+string CatalogManager::NormalizeTableName(const string& table_name) {
+  // Force a deep copy on platforms with reference counted strings.
+  string normalized_table_name(table_name.data(), table_name.size());
+  if (hms::HmsCatalog::IsEnabled()) {
+    // If HmsCatalog::NormalizeTableName returns an error, the table name is not
+    // modified. In this case the table is guaranteed to be a legacy table which
+    // has survived since before the cluster was configured to integrate with
+    // the HMS. It's safe to use the unmodified table name as the normalized
+    // name in this case, since there cannot be a name conflict with a table in
+    // the HMS. When the table gets 'upgraded' to be included in the HMS it will
+    // need to be renamed with a Hive compatible name.
+    //
+    // Note: not all legacy tables will fail normalization; if a table happens
+    // to be named with a Hive compatible name ("Legacy.Table"), it will be
+    // normalized according to the Hive rules ("legacy.table"). We check in
+    // TableLoader::VisitTables that such legacy tables do not have conflicting
+    // names when normalized.
+    ignore_result(hms::HmsCatalog::NormalizeTableName(&normalized_table_name));
+  }
+  return normalized_table_name;
 }
 
 const char* CatalogManager::StateToString(State state) {

@@ -157,6 +157,12 @@ class MasterStressTest : public KuduTest,
     // the global operation timeout.
     builder.default_admin_operation_timeout(kDefaultAdminTimeout);
 
+    // The C++ client currently uses the normal RPC timeout to retry DDL
+    // operations to alternate masters, which effectively reduces the admin
+    // timeout to the RPC timeout. With HMS integration some DDL operations can
+    // exceed the default 10s timeout.
+    builder.default_rpc_timeout(MonoDelta::FromSeconds(30));
+
     ASSERT_OK(cluster_->CreateClient(&builder, &client_));
 
     // Populate the ts_map_ for the ReplaceTablet thread.
@@ -390,7 +396,7 @@ class MasterStressTest : public KuduTest,
 
  private:
   string GenerateTableName() {
-    return Substitute("default.table_$0", oid_generator_.Next());
+    return Substitute("default.Table_$0", oid_generator_.Next());
   }
 
   bool BlockingGetTableName(string* chosen_table) {

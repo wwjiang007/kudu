@@ -659,6 +659,33 @@ message ConnectToMasterResponsePB {
   // an HA setup. If that master then fails, the applications would go
   // offline.
   repeated HostPortPB master_addrs = 5;
+
+  // If the master is configured with the Hive Metastore integration enabled,
+  // this field will include the configuration options.
+  optional HiveMetastoreConfig hms_config = 6;
+}
+
+// Hive Metastore integration options and configuration.
+message HiveMetastoreConfig {
+
+  // Address(es) of the Hive Metastore instance(s).
+  //
+  // For more info see the Kudu master --hive_metastore_uris flag for more info,
+  // or the Hive Metastore hive.metastore.uris configuration.
+  optional string hms_uris = 1;
+
+  // Whether the Hive Metastore instance uses SASL (Kerberos) security.
+  //
+  // For more info see the Kudu master --hive_metastore_sasl_enabled flag, or
+  // the Hive Metastore hive.metastore.sasl.enabled configuration.
+  optional bool hms_sasl_enabled = 2;
+
+  // An ID which uniquely identifies the Hive Metastore instance.
+  //
+  // NOTE: this is provided on a best-effort basis, as not all Hive Metastore
+  // versions which Kudu is compatible with include the necessary APIs. See
+  // HIVE-16452 for more info.
+  optional string hms_uuid = 3;
 }
 
 // ============================================================================
@@ -753,7 +780,7 @@ service MasterService {
   // TS->Master RPCs
   // ------------------------------------------------------------
   rpc TSHeartbeat(TSHeartbeatRequestPB) returns (TSHeartbeatResponsePB) {
-    option (kudu.rpc.authz_method) = "AuthorizeService";
+    option (kudu.rpc.authz_method) = "AuthorizeServiceUser";
   }
 
   // Client->Master RPCs
@@ -804,7 +831,7 @@ service MasterService {
     option (kudu.rpc.authz_method) = "AuthorizeClient";
   }
   rpc Ping(PingRequestPB) returns (PingResponsePB) {
-    option (kudu.rpc.authz_method) = "AuthorizeClientOrService";
+    option (kudu.rpc.authz_method) = "AuthorizeClientOrServiceUser";
   }
   rpc ReplaceTablet(ReplaceTabletRequestPB) returns (ReplaceTabletResponsePB) {
     option (kudu.rpc.authz_method) = "AuthorizeSuperUser";
@@ -817,6 +844,6 @@ service MasterService {
   // cluster.
   rpc GetMasterRegistration(GetMasterRegistrationRequestPB) returns
       (GetMasterRegistrationResponsePB) {
-    option (kudu.rpc.authz_method) = "AuthorizeClientOrService";
+    option (kudu.rpc.authz_method) = "AuthorizeClientOrServiceUser";
   }
 }

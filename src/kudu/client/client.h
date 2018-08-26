@@ -52,19 +52,20 @@ namespace kudu {
 class ClientStressTest_TestUniqueClientIds_Test;
 class KuduPartialRow;
 class MasterHmsTest_TestAlterTable_Test;
+class MasterHmsUpgradeTest_TestRenameExistingTables_Test;
 class MonoDelta;
 class PartitionSchema;
 class SecurityUnknownTskTest;
 
 namespace client {
 class KuduClient;
+class KuduTableAlterer;
 }
 
 namespace tools {
 class LeaderMasterProxy;
-
-Status AlterKuduTable(const client::sp::shared_ptr<client::KuduClient>& kudu_client,
-                      const std::string& name, const std::string& new_name);
+std::string GetMasterAddresses(const client::KuduClient&);
+void SetAlterExternalCatalogs(client::KuduTableAlterer*, bool);
 } // namespace tools
 
 namespace client {
@@ -77,7 +78,6 @@ class KuduScanBatch;
 class KuduSession;
 class KuduStatusCallback;
 class KuduTable;
-class KuduTableAlterer;
 class KuduTableCreator;
 class KuduTablet;
 class KuduTabletServer;
@@ -536,9 +536,39 @@ class KUDU_EXPORT KuduClient : public sp::enable_shared_from_this<KuduClient> {
   /// @return Status object for the operation.
   Status ExportAuthenticationCredentials(std::string* authn_creds) const;
 
+  // @return the configured Hive Metastore URIs on the most recently connected to
+  //    leader master, or an empty string if the Hive Metastore integration is not
+  //    enabled.
+  std::string KUDU_NO_EXPORT GetHiveMetastoreUris() const;
+
+  // @return the configured Hive Metastore SASL (Kerberos) configuration on the most
+  //    recently connected to leader master, or an arbitrary value if the Hive
+  //    Metastore integration is not enabled.
+  bool KUDU_NO_EXPORT GetHiveMetastoreSaslEnabled() const;
+
+  // @return a unique ID which identifies the Hive Metastore instance, if the
+  //    cluster is configured with the Hive Metastore integration, or an
+  //    arbitrary value if the Hive Metastore integration is not enabled.
+  //
+  // @note this is provided on a best-effort basis, as not all Hive Metastore
+  //    versions which Kudu is compatible with include the necessary APIs. See
+  //    HIVE-16452 for more info.
+  std::string KUDU_NO_EXPORT GetHiveMetastoreUuid() const;
+
  private:
   class KUDU_NO_EXPORT Data;
 
+  friend class ClientTest;
+  friend class ConnectToClusterBaseTest;
+  friend class KuduClientBuilder;
+  friend class KuduPartitionerBuilder;
+  friend class KuduScanToken;
+  friend class KuduScanTokenBuilder;
+  friend class KuduScanner;
+  friend class KuduSession;
+  friend class KuduTable;
+  friend class KuduTableAlterer;
+  friend class KuduTableCreator;
   friend class internal::Batcher;
   friend class internal::GetTableSchemaRpc;
   friend class internal::LookupRpc;
@@ -546,19 +576,9 @@ class KUDU_EXPORT KuduClient : public sp::enable_shared_from_this<KuduClient> {
   friend class internal::RemoteTablet;
   friend class internal::RemoteTabletServer;
   friend class internal::WriteRpc;
-  friend class ConnectToClusterBaseTest;
-  friend class ClientTest;
-  friend class KuduClientBuilder;
-  friend class KuduPartitionerBuilder;
-  friend class KuduScanner;
-  friend class KuduScanToken;
-  friend class KuduScanTokenBuilder;
-  friend class KuduSession;
-  friend class KuduTable;
-  friend class KuduTableAlterer;
-  friend class KuduTableCreator;
-  friend class ::kudu::SecurityUnknownTskTest;
+  friend class kudu::SecurityUnknownTskTest;
   friend class tools::LeaderMasterProxy;
+  friend std::string tools::GetMasterAddresses(const client::KuduClient&);
 
   FRIEND_TEST(kudu::ClientStressTest, TestUniqueClientIds);
   FRIEND_TEST(ClientTest, TestGetSecurityInfoFromMaster);
@@ -1191,12 +1211,9 @@ class KUDU_EXPORT KuduTableAlterer {
 
   friend class KuduClient;
 
-  friend Status tools::AlterKuduTable(
-      const client::sp::shared_ptr<client::KuduClient>& kudu_client,
-      const std::string& name,
-      const std::string& new_name);
-
+  friend void tools::SetAlterExternalCatalogs(KuduTableAlterer*, bool);
   FRIEND_TEST(kudu::MasterHmsTest, TestAlterTable);
+  FRIEND_TEST(kudu::MasterHmsUpgradeTest, TestRenameExistingTables);
 
   KuduTableAlterer(KuduClient* client,
                    const std::string& name);

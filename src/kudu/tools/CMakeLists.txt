@@ -117,6 +117,7 @@ add_executable(kudu
   tool_main.cc
 )
 target_link_libraries(kudu
+  ${SANITIZER_OPTIONS_OVERRIDE}
   ${KRB5_REALM_OVERRIDE}
   clock
   consensus
@@ -153,18 +154,19 @@ target_link_libraries(kudu_tools_test_util
 # Unit tests
 #######################################
 
-set(KUDU_TEST_LINK_LIBS
-  ksck
-  kudu_tools_util
-  kudu_tools_test_util
-  kudu_tools_rebalance
+SET_KUDU_TEST_LINK_LIBS(
   itest_util
-  mini_cluster
-  ${KUDU_MIN_TEST_LIBS})
+  ksck
+  kudu_hms
+  kudu_tools_rebalance
+  kudu_tools_test_util
+  kudu_tools_util
+  mini_cluster)
 ADD_KUDU_TEST(diagnostics_log_parser-test)
 ADD_KUDU_TEST(ksck-test)
 ADD_KUDU_TEST(ksck_remote-test PROCESSORS 3)
-ADD_KUDU_TEST(kudu-admin-test PROCESSORS 3)
+ADD_KUDU_TEST(kudu-admin-test
+  NUM_SHARDS 8 PROCESSORS 3)
 ADD_KUDU_TEST_DEPENDENCIES(kudu-admin-test
   kudu)
 ADD_KUDU_TEST(kudu-tool-test

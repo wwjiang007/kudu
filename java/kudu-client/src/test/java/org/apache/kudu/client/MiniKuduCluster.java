@@ -19,9 +19,12 @@ import static java.nio.charset.StandardCharsets.UTF_8;
 import java.io.BufferedReader;
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
+import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
+import java.nio.file.Files;
+import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -33,6 +36,7 @@ import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.google.common.net.HostAndPort;
 
+import org.apache.kudu.Common;
 import org.apache.kudu.Common.HostPortPB;
 import org.apache.kudu.tools.Tool.ControlShellRequestPB;
 import org.apache.kudu.tools.Tool.ControlShellResponsePB;
@@ -90,21 +94,53 @@ public class MiniKuduCluster implements AutoCloseable {
   private final int numTservers;
   private final ImmutableList<String> extraTserverFlags;
   private final ImmutableList<String> extraMasterFlags;
+  private final String clusterRoot;
 
   private MiniKdcOptionsPB kdcOptionsPb;
+  private final Common.HmsMode hmsMode;
 
   private MiniKuduCluster(boolean enableKerberos,
       int numMasters,
       int numTservers,
       List<String> extraTserverFlags,
       List<String> extraMasterFlags,
-      MiniKdcOptionsPB kdcOptionsPb) {
+      MiniKdcOptionsPB kdcOptionsPb,
+      String clusterRoot,
+      Common.HmsMode hmsMode) {
     this.enableKerberos = enableKerberos;
     this.numMasters = numMasters;
     this.numTservers = numTservers;
     this.extraTserverFlags = ImmutableList.copyOf(extraTserverFlags);
     this.extraMasterFlags = ImmutableList.copyOf(extraMasterFlags);
     this.kdcOptionsPb = kdcOptionsPb;
+    this.hmsMode = hmsMode;
+
+    if (clusterRoot == null) {
+      // If a cluster root was not set, create a  unique temp directory to use.
+      // The mini cluster will clean this directory up on exit.
+      try {
+        File tempRoot = getTempDirectory("mini-kudu-cluster");
+        this.clusterRoot = tempRoot.toString();
+      } catch (IOException ex) {
+        throw new RuntimeException("Could not create cluster root directory", ex);
+      }
+    } else {
+      this.clusterRoot = clusterRoot;
+    }
+  }
+
+  // Match the C++ MiniCluster test functionality for overriding the tmp directory used.
+  // See MakeClusterRoot in src/kudu/tools/tool_action_test.cc.
+  // If the TEST_TMPDIR environment variable is defined that directory will be used
+  // instead of the default temp directory.
+  private File getTempDirectory(String prefix) throws IOException  {
+    String testTmpdir = System.getenv("TEST_TMPDIR");
+    if (testTmpdir != null) {
+      LOG.info("Using the temp directory defined by TEST_TMPDIR: " + testTmpdir);
+      return Files.createTempDirectory(Paths.get(testTmpdir), prefix).toFile();
+    } else {
+      return Files.createTempDirectory(prefix).toFile();
+    }
   }
 
   /**
@@ -173,9 +209,11 @@ public class MiniKuduCluster implements AutoCloseable {
             .setNumMasters(numMasters)
             .setNumTservers(numTservers)
             .setEnableKerberos(enableKerberos)
+            .setHmsMode(hmsMode)
             .addAllExtraMasterFlags(extraMasterFlags)
             .addAllExtraTserverFlags(extraTserverFlags)
             .setMiniKdcOptions(kdcOptionsPb)
+            .setClusterRoot(clusterRoot)
             .build())
         .build());
     sendRequestToCluster(
@@ -496,9 +534,10 @@ public class MiniKuduCluster implements AutoCloseable {
     private boolean enableKerberos = false;
     private final List<String> extraTserverFlags = new ArrayList<>();
     private final List<String> extraMasterFlags = new ArrayList<>();
+    private String clusterRoot = null;
 
-    private MiniKdcOptionsPB.Builder kdcOptionsPb =
-        MiniKdcOptionsPB.newBuilder();
+    private MiniKdcOptionsPB.Builder kdcOptionsPb = MiniKdcOptionsPB.newBuilder();
+    private Common.HmsMode hmsMode = Common.HmsMode.NONE;
 
     public MiniKuduClusterBuilder numMasters(int numMasters) {
       this.numMasters = numMasters;
@@ -516,6 +555,11 @@ public class MiniKuduCluster implements AutoCloseable {
      */
     public MiniKuduClusterBuilder enableKerberos() {
       enableKerberos = true;
+      return this;
+    }
+
+    public MiniKuduClusterBuilder enableHiveMetastoreIntegration() {
+      hmsMode = Common.HmsMode.ENABLE_METASTORE_INTEGRATION;
       return this;
     }
 
@@ -548,6 +592,15 @@ public class MiniKuduCluster implements AutoCloseable {
     }
 
     /**
+     * Sets the directory where the cluster's data and logs should be placed.
+     * @return this instance
+     */
+    public MiniKuduClusterBuilder clusterRoot(String clusterRoot) {
+      this.clusterRoot = clusterRoot;
+      return this;
+    }
+
+    /**
      * Builds and starts a new {@link MiniKuduCluster} using builder state.
      * @return the newly started {@link MiniKuduCluster}
      * @throws IOException if something went wrong starting the cluster
@@ -557,7 +610,7 @@ public class MiniKuduCluster implements AutoCloseable {
           new MiniKuduCluster(enableKerberos,
               numMasters, numTservers,
               extraTserverFlags, extraMasterFlags,
-              kdcOptionsPb.build());
+              kdcOptionsPb.build(), clusterRoot, hmsMode);
       try {
         cluster.start();
       } catch (IOException e) {

@@ -37,6 +37,7 @@
 #include "kudu/common/wire_protocol.pb.h"
 #include "kudu/gutil/basictypes.h"
 #include "kudu/gutil/strings/join.h"
+#include "kudu/gutil/strings/stringpiece.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/gutil/strings/util.h"
 #include "kudu/hms/mini_hms.h"
@@ -189,6 +190,7 @@ Status ExternalMiniCluster::Start() {
   if (opts_.hms_mode == HmsMode::ENABLE_HIVE_METASTORE ||
       opts_.hms_mode == HmsMode::ENABLE_METASTORE_INTEGRATION) {
     hms_.reset(new hms::MiniHms());
+    hms_->SetDataRoot(opts_.cluster_root);
 
     if (opts_.enable_kerberos) {
       string spn = "hive/127.0.0.1";
@@ -258,6 +260,20 @@ Status ExternalMiniCluster::Restart() {
 
 void ExternalMiniCluster::EnableMetastoreIntegration() {
   opts_.hms_mode = HmsMode::ENABLE_METASTORE_INTEGRATION;
+}
+
+void ExternalMiniCluster::DisableMetastoreIntegration() {
+  for (const auto& master : masters_) {
+    CHECK(master->IsShutdown()) << "Call Shutdown() before changing the HMS mode";
+    master->mutable_flags()->erase(
+        std::remove_if(
+          master->mutable_flags()->begin(), master->mutable_flags()->end(),
+          [] (const string& flag) {
+            return StringPiece(flag).starts_with("--hive_metastore");
+          }),
+        master->mutable_flags()->end());
+  }
+  opts_.hms_mode = HmsMode::ENABLE_HIVE_METASTORE;
 }
 
 void ExternalMiniCluster::SetDaemonBinPath(string daemon_bin_path) {
@@ -377,8 +393,9 @@ Status ExternalMiniCluster::StartMasters() {
     opts.rpc_bind_address = master_rpc_addrs[i];
     if (opts_.hms_mode == HmsMode::ENABLE_METASTORE_INTEGRATION) {
       opts.extra_flags.emplace_back(Substitute("--hive_metastore_uris=$0", hms_->uris()));
-      opts.extra_flags.emplace_back(Substitute("--hive_metastore_sasl_enabled=$0",
-                                               opts_.enable_kerberos));
+      if (opts_.enable_kerberos) {
+        opts.extra_flags.emplace_back("--hive_metastore_sasl_enabled=true");
+      }
     }
     opts.logtostderr = opts_.logtostderr;
 
@@ -869,8 +886,7 @@ void ExternalDaemon::SetExePath(string exe) {
 void ExternalDaemon::SetMetastoreIntegration(const string& hms_uris,
                                              bool enable_kerberos) {
   opts_.extra_flags.emplace_back(Substitute("--hive_metastore_uris=$0", hms_uris));
-  opts_.extra_flags.emplace_back(Substitute("--hive_metastore_sasl_enabled=$0",
-                                            enable_kerberos));
+  opts_.extra_flags.emplace_back(Substitute("--hive_metastore_sasl_enabled=$0", enable_kerberos));
 }
 
 Status ExternalDaemon::Pause() {

@@ -507,9 +507,11 @@ Status RaftConsensus::StartElection(ElectionMode mode, ElectionReason reason) {
         queue_->GetLastOpIdInLog();
 
     election.reset(new LeaderElection(
-        active_config,
+        std::move(active_config),
+        // The RaftConsensus ref passed below ensures that this raw pointer
+        // remains safe to use for the entirety of LeaderElection's life.
         peer_proxy_factory_.get(),
-        request, std::move(counter), timeout,
+        std::move(request), std::move(counter), timeout,
         std::bind(&RaftConsensus::ElectionCallback,
                   shared_from_this(),
                   reason, std::placeholders::_1)));
@@ -550,8 +552,8 @@ Status RaftConsensus::StepDown(LeaderStepDownResponsePB* resp) {
     return Status::OK();
   }
   LOG_WITH_PREFIX_UNLOCKED(INFO) << "Received request to step down";
-  RETURN_NOT_OK(BecomeReplicaUnlocked());
-
+  RETURN_NOT_OK(HandleTermAdvanceUnlocked(CurrentTermUnlocked() + 1,
+                                          SKIP_FLUSH_TO_DISK));
   // Snooze the failure detector for an extra leader failure timeout.
   // This should ensure that a different replica is elected leader after this one steps down.
   SnoozeFailureDetector(string("explicit stepdown request"), MonoDelta::FromMilliseconds(
@@ -1317,6 +1319,16 @@ Status RaftConsensus::UpdateReplica(const ConsensusRequestPB* request,
     SnoozeFailureDetector();
 
     last_leader_communication_time_micros_ = GetMonoTimeMicros();
+
+    // Reset the 'failed_elections_since_stable_leader' metric now that we've
+    // accepted an update from the established leader. This is done in addition
+    // to the reset of the value in SetLeaderUuidUnlocked() because there is
+    // a potential race between resetting the failed elections count in
+    // SetLeaderUuidUnlocked() and incrementing after a failed election
+    // if another replica was elected leader in an election concurrent with
+    // the one called by this replica.
+    failed_elections_since_stable_leader_ = 0;
+    num_failed_elections_metric_->set_value(failed_elections_since_stable_leader_);
 
     // We update the lag metrics here in addition to after appending to the queue so the
     // metrics get updated even when the operation is rejected.

@@ -37,6 +37,7 @@
 #include "kudu/rpc/sasl_common.h"
 #include "kudu/security/test/mini_kdc.h"
 #include "kudu/util/net/net_util.h"
+#include "kudu/util/slice.h"
 #include "kudu/util/status.h"
 #include "kudu/util/test_macros.h"
 #include "kudu/util/test_util.h"
@@ -55,35 +56,64 @@ namespace kudu {
 namespace hms {
 
 TEST(HmsCatalogStaticTest, TestParseTableName) {
-  string db;
-  string tbl;
+  Slice db;
+  Slice tbl;
+  string table;
 
-  EXPECT_OK(HmsCatalog::ParseTableName("foo.bar", &db, &tbl));
+  table = "foo.bar";
+  ASSERT_OK(HmsCatalog::ParseTableName(table, &db, &tbl));
   EXPECT_EQ("foo", db);
   EXPECT_EQ("bar", tbl);
 
-  EXPECT_OK(HmsCatalog::ParseTableName("99bottles.my_awesome/table/22", &db, &tbl));
+  table = "99bottles.my_awesome/table/22";
+  ASSERT_OK(HmsCatalog::ParseTableName(table, &db, &tbl));
   EXPECT_EQ("99bottles", db);
   EXPECT_EQ("my_awesome/table/22", tbl);
 
-  EXPECT_OK(HmsCatalog::ParseTableName("_leading_underscore.trailing_underscore_", &db, &tbl));
+  table = "_leading_underscore.trailing_underscore_";
+  ASSERT_OK(HmsCatalog::ParseTableName(table, &db, &tbl));
   EXPECT_EQ("_leading_underscore", db);
   EXPECT_EQ("trailing_underscore_", tbl);
 
-  EXPECT_OK(HmsCatalog::ParseTableName("unicode ☃ tables?.maybe/one_day", &db, &tbl));
-  EXPECT_EQ("unicode ☃ tables?", db);
-  EXPECT_EQ("maybe/one_day", tbl);
-
-  EXPECT_OK(HmsCatalog::ParseTableName(".", &db, &tbl));
-  EXPECT_EQ("", db);
-  EXPECT_EQ("", tbl);
-
-  EXPECT_OK(HmsCatalog::ParseTableName(string("\0.\0", 3), &db, &tbl));
-  EXPECT_EQ(string("\0", 1), db);
-  EXPECT_EQ(string("\0", 1), tbl);
-
+  EXPECT_TRUE(HmsCatalog::ParseTableName(".", &db, &tbl).IsInvalidArgument());
   EXPECT_TRUE(HmsCatalog::ParseTableName("no-table", &db, &tbl).IsInvalidArgument());
   EXPECT_TRUE(HmsCatalog::ParseTableName("lots.of.tables", &db, &tbl).IsInvalidArgument());
+  EXPECT_TRUE(HmsCatalog::ParseTableName("no-table", &db, &tbl).IsInvalidArgument());
+  EXPECT_TRUE(HmsCatalog::ParseTableName("lots.of.tables", &db, &tbl).IsInvalidArgument());
+  EXPECT_TRUE(HmsCatalog::ParseTableName(".no_table", &db, &tbl).IsInvalidArgument());
+  EXPECT_TRUE(HmsCatalog::ParseTableName(".no_database", &db, &tbl).IsInvalidArgument());
+  EXPECT_TRUE(HmsCatalog::ParseTableName("punctuation?.no", &db, &tbl).IsInvalidArgument());
+  EXPECT_TRUE(HmsCatalog::ParseTableName("white space.no", &db, &tbl).IsInvalidArgument());
+  EXPECT_TRUE(HmsCatalog::ParseTableName("unicode☃tables.no", &db, &tbl).IsInvalidArgument());
+  EXPECT_TRUE(HmsCatalog::ParseTableName(string("\0.\0", 3), &db, &tbl).IsInvalidArgument());
+}
+
+TEST(HmsCatalogStaticTest, TestNormalizeTableName) {
+  string table = "foo.bar";
+  ASSERT_OK(HmsCatalog::NormalizeTableName(&table));
+  ASSERT_EQ("foo.bar", table);
+
+  table = "fOo.BaR";
+  ASSERT_OK(HmsCatalog::NormalizeTableName(&table));
+  EXPECT_EQ("foo.bar", table);
+
+  table = "A.B";
+  ASSERT_OK(HmsCatalog::NormalizeTableName(&table));
+  EXPECT_EQ("a.b", table);
+
+  table = "__/A__.buzz";
+  ASSERT_OK(HmsCatalog::NormalizeTableName(&table));
+  EXPECT_EQ("__/a__.buzz", table);
+
+  table = "THE/QUICK/BROWN/FOX/JUMPS/OVER/THE/LAZY/DOG."
+          "the_quick_brown_fox_jumps_over_the_lazy_dog";
+  ASSERT_OK(HmsCatalog::NormalizeTableName(&table));
+  EXPECT_EQ("the/quick/brown/fox/jumps/over/the/lazy/dog."
+            "the_quick_brown_fox_jumps_over_the_lazy_dog", table);
+
+  table = "default.MyTable";
+  ASSERT_OK(HmsCatalog::NormalizeTableName(&table));
+  EXPECT_EQ("default.mytable", table);
 }
 
 TEST(HmsCatalogStaticTest, TestParseUris) {
@@ -366,36 +396,39 @@ TEST_F(HmsCatalogTest, TestExternalTable) {
   NO_FATALS(CheckTableDoesNotExist("default", "bogus_table_name"));
 }
 
-TEST_F(HmsCatalogTest, TestRetrieveTables) {
+TEST_F(HmsCatalogTest, TestGetKuduTables) {
   const string kHmsDatabase = "db";
   const string kManagedTableName = "managed_table";
   const string kExternalTableName = "external_table";
+  const string kTableName = "external_table";
   const string kNonKuduTableName = "non_kudu_table";
 
-  // Create a Impala managed table, a external table and a non Kudu table.
+  // Create a legacy Impala managed table, a legacy Impala external table, a
+  // Kudu table, and a non Kudu table.
   hive::Database db;
-  db.name = kHmsDatabase;
+  db.name = "db";
   ASSERT_OK(hms_client_->CreateDatabase(db));
-  ASSERT_OK(CreateLegacyTable(kHmsDatabase,
-                              kManagedTableName,
-                              HmsClient::kManagedTable));
+  ASSERT_OK(CreateLegacyTable("db", "managed_table", HmsClient::kManagedTable));
   hive::Table table;
-  ASSERT_OK(hms_client_->GetTable(kHmsDatabase, kManagedTableName, &table));
-  ASSERT_OK(CreateLegacyTable(kHmsDatabase,
-                              kExternalTableName,
-                              HmsClient::kExternalTable));
-  ASSERT_OK(hms_client_->GetTable(kHmsDatabase, kExternalTableName, &table));
+  ASSERT_OK(hms_client_->GetTable(kHmsDatabase, "managed_table", &table));
+  ASSERT_OK(CreateLegacyTable("db", "external_table", HmsClient::kExternalTable));
+  ASSERT_OK(hms_client_->GetTable("db", "external_table", &table));
+
+  ASSERT_OK(hms_catalog_->CreateTable("fake-id", "db.table", Schema()));
 
   hive::Table non_kudu_table;
-  non_kudu_table.dbName = kHmsDatabase;
-  non_kudu_table.tableName = kNonKuduTableName;
+  non_kudu_table.dbName = "db";
+  non_kudu_table.tableName = "non_kudu_table";
   ASSERT_OK(hms_client_->CreateTable(non_kudu_table));
-  ASSERT_OK(hms_client_->GetTable(kHmsDatabase, kNonKuduTableName, &table));
+  ASSERT_OK(hms_client_->GetTable("db", "non_kudu_table", &table));
 
   // Retrieve all tables and ensure all entries are found.
-  vector<hive::Table> hms_tables;
-  ASSERT_OK(hms_catalog_->RetrieveTables(&hms_tables));
-  ASSERT_EQ(3, hms_tables.size());
+  vector<hive::Table> kudu_tables;
+  ASSERT_OK(hms_catalog_->GetKuduTables(&kudu_tables));
+  ASSERT_EQ(3, kudu_tables.size());
+  for (const auto& kudu_table : kudu_tables) {
+    ASSERT_FALSE(kudu_table.tableName == "non_kudu_table") << kudu_table;
+  }
 }
 
 // Checks that the HmsCatalog handles reconnecting to the metastore after a connection failure.

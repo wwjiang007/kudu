@@ -35,6 +35,7 @@
 #include "kudu/client/master_rpc.h"
 #include "kudu/client/meta_cache.h"
 #include "kudu/client/schema.h"
+#include "kudu/common/common.pb.h"
 #include "kudu/common/partition.h"
 #include "kudu/common/schema.h"
 #include "kudu/common/wire_protocol.h"
@@ -46,6 +47,7 @@
 #include "kudu/master/master.h"
 #include "kudu/master/master.pb.h"
 #include "kudu/master/master.proxy.h"
+#include "kudu/rpc/connection.h"
 #include "kudu/rpc/messenger.h"
 #include "kudu/rpc/request_tracker.h"
 #include "kudu/rpc/rpc_controller.h"
@@ -60,7 +62,6 @@
 #include "kudu/util/net/sockaddr.h"
 #include "kudu/util/pb_util.h"
 #include "kudu/util/thread_restrictions.h"
-#include "kudu/rpc/connection.h"
 
 using std::pair;
 using std::set;
@@ -356,7 +357,8 @@ Status KuduClient::Data::SyncLeaderMasterRpc(
     vector<uint32_t> required_feature_flags);
 
 KuduClient::Data::Data()
-    : latest_observed_timestamp_(KuduClient::kNoTimestamp) {
+    : hive_metastore_sasl_enabled_(false),
+      latest_observed_timestamp_(KuduClient::kNoTimestamp) {
 }
 
 KuduClient::Data::~Data() {
@@ -702,6 +704,16 @@ void KuduClient::Data::ConnectedToClusterCb(
 
     if (status.ok()) {
       leader_master_hostport_ = HostPort(leader_hostname, leader_addr.port());
+      master_hostports_.clear();
+      for (const auto& hostport : connect_response.master_addrs()) {
+        master_hostports_.emplace_back(HostPort(hostport.host(), hostport.port()));
+      }
+
+      const auto& hive_config = connect_response.hms_config();
+      hive_metastore_uris_ = hive_config.hms_uris();
+      hive_metastore_sasl_enabled_ = hive_config.hms_sasl_enabled();
+      hive_metastore_uuid_ = hive_config.hms_uuid();
+
       master_proxy_.reset(new MasterServiceProxy(messenger_, leader_addr, leader_hostname));
       master_proxy_->set_user_credentials(user_credentials_);
     }
@@ -820,6 +832,11 @@ void KuduClient::Data::ConnectToClusterAsync(KuduClient* client,
 HostPort KuduClient::Data::leader_master_hostport() const {
   std::lock_guard<simple_spinlock> l(leader_master_lock_);
   return leader_master_hostport_;
+}
+
+vector<HostPort> KuduClient::Data::master_hostports() const {
+  std::lock_guard<simple_spinlock> l(leader_master_lock_);
+  return master_hostports_;
 }
 
 shared_ptr<master::MasterServiceProxy> KuduClient::Data::master_proxy() const {
